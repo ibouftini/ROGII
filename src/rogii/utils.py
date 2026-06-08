@@ -1,8 +1,7 @@
 import os
 import glob
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import pandas as pd
-import numpy as np
 
 
 @dataclass
