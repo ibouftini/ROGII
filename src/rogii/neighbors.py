@@ -1,5 +1,6 @@
 from collections import defaultdict
 import numpy as np
+import pandas as pd
 from scipy.spatial import cKDTree
 
 FORMATIONS = ['ANCC', 'ASTNU', 'ASTNL', 'EGFDU', 'EGFDL', 'BUDA']
@@ -45,8 +46,6 @@ class FormationPlaneKNN:
         avg = (self._depths[cluster_id][idx] * w[:, None]).sum(axis=0)
         return dict(zip(FORMATIONS, avg))
 
-
-import pandas as pd
 
 def _tw_signature(tw: pd.DataFrame, n: int = 50) -> str:
     """Hash of first n non-null GR values rounded to 1 decimal."""
