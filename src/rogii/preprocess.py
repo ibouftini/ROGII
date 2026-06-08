@@ -44,7 +44,7 @@ def calibrate_gr(hw: pd.DataFrame, tw: pd.DataFrame, ps_idx: int) -> tuple[float
     """Affine fit: a*GR_hw + b ~ GR_tw in known zone. Returns (a, b, calibrated_hw)."""
     known = hw.iloc[:ps_idx].dropna(subset=['TVT_input', 'GR'])
     if len(known) < 10:
-        return 1.0, 0.0, hw
+        return 1.0, 0.0, hw.copy()
     tw_gr = np.interp(known['TVT_input'].values, tw['TVT'].values, tw['GR'].values)
     hw_gr = known['GR'].values
     A = np.column_stack([hw_gr, np.ones(len(hw_gr))])
