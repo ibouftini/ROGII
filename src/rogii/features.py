@@ -84,3 +84,75 @@ def compute_formation_features(
         approx = -z_k + formation_depths.get(f, 0.0) + b_well.get(f, 0.0)
         data[f'form_rmse_{f}'] = float(np.sqrt(np.mean((tvt_k - approx) ** 2)))
     return pd.DataFrame(data, index=hw.index[ps_idx:])
+
+
+def compute_gr_features(
+    hw: pd.DataFrame, ps_idx: int, a_cal: float, b_cal: float,
+    tw_tvt: np.ndarray, tw_gr: np.ndarray, baseline_tvt: np.ndarray,
+) -> pd.DataFrame:
+    eval_hw = hw.iloc[ps_idx:]
+    gr = eval_hw['GR'].values
+    data = {}
+    for w in [11, 51, 151]:
+        s = pd.Series(gr)
+        data[f'gr_roll_mean_{w}'] = s.rolling(w, min_periods=1, center=True).mean().values
+        data[f'gr_roll_std_{w}']  = s.rolling(w, min_periods=1, center=True).std(ddof=0).fillna(0).values
+    data['hgr_env']  = pd.Series(gr).rolling(21, min_periods=1, center=True).max().values
+    data['hgr_nrg']  = np.sqrt(pd.Series(gr ** 2).rolling(21, min_periods=1, center=True).mean().values)
+    data['a_cal']    = a_cal
+    data['b_cal']    = b_cal
+    data['gr_imputed_flag'] = eval_hw['gr_imputed'].values if 'gr_imputed' in eval_hw.columns else 0
+    data['tw_gr_at_baseline_tvt'] = np.interp(baseline_tvt, tw_tvt, tw_gr)
+    return pd.DataFrame(data, index=eval_hw.index)
+
+
+def compute_tabular_features(
+    hw: pd.DataFrame, ps_idx: int, scalars: dict, cluster_id: int,
+    signal_df: pd.DataFrame,
+) -> pd.DataFrame:
+    eval_hw = hw.iloc[ps_idx:]
+    n = len(eval_hw)
+    md_from_ps = eval_hw['MD'].values - scalars['md_at_ps']
+    sig_cols = [c for c in TVT_SIGNAL_COLS if c in signal_df.columns]
+    inter_std = signal_df[sig_cols].std(axis=1).values if sig_cols else np.zeros(n)
+    data = dict(
+        md_from_ps=md_from_ps,
+        row_from_ps=np.arange(n, dtype=float),
+        row_frac=np.arange(n) / max(1, n - 1),
+        last_known_tvt=scalars['last_known_tvt'],
+        slope_tvt_md_all=scalars['slope_tvt_md_all'],
+        slope_tvt_md_recent=scalars['slope_tvt_md_recent'],
+        z_span=scalars['z_span'],
+        eval_zone_length=float(scalars['eval_zone_length']),
+        cluster_id=float(cluster_id),
+        inter_signal_std=inter_std,
+    )
+    return pd.DataFrame(data, index=eval_hw.index)
+
+
+def build_feature_matrix(
+    hw: pd.DataFrame, tw: pd.DataFrame, ps_idx: int,
+    alignment: dict, formations: dict, b_well: dict,
+    scalars: dict, cluster_id: int, a_cal: float, b_cal: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Assemble ~80-column feature matrix and TVT increment target."""
+    baseline = alignment.get('beam_ref', alignment.get('pf_ancc'))
+    gr_full = hw['GR'].values
+
+    eval_idx  = hw.index[ps_idx:]
+    df_align  = build_alignment_df(hw, ps_idx, alignment)
+    df_anchor = compute_anchor_offsets(baseline, tw['TVT'].values, tw['GR'].values, gr_full[ps_idx:])
+    df_anchor.index = eval_idx
+    df_form   = compute_formation_features(hw, ps_idx, formations, b_well)
+    df_gr     = compute_gr_features(hw, ps_idx, a_cal, b_cal, tw['TVT'].values, tw['GR'].values, baseline)
+    df_tab    = compute_tabular_features(hw, ps_idx, scalars, cluster_id, df_align)
+
+    df = pd.concat([df_align, df_anchor, df_form, df_gr, df_tab], axis=1)
+
+    # target: TVT increment
+    tvt = hw['TVT'].values
+    tvt_eval = tvt[ps_idx:]
+    tvt_prev = np.concatenate([[tvt[ps_idx - 1]], tvt_eval[:-1]])
+    y = tvt_eval - tvt_prev
+
+    return df.values.astype(np.float32), y.astype(np.float32)
