@@ -70,3 +70,24 @@ def test_ncc_hyb_ref_formula(hw, tw):
     sc_trust = result['sc_trust']
     expected = (1 - sc_trust) * baseline + sc_trust * result['sc15_tvt']
     np.testing.assert_allclose(result['hyb_ref'], expected)
+
+
+from rogii.alignment.dtw import run_dtw_all_radii
+
+def test_dtw_output_keys(hw, tw):
+    gr = hw['GR'].ffill().values[200:]
+    result = run_dtw_all_radii(gr, tw['TVT'].values, tw['GR'].values, radii=[20, 50], k=3)
+    for key in ['dtw_r20_mean', 'dtw_r20_std', 'dtw_r20_cv',
+                'dtw_r50_mean', 'dtw_r50_std', 'dtw_r50_cv']:
+        assert key in result
+
+def test_dtw_std_positive(hw, tw):
+    gr = hw['GR'].ffill().values[200:]
+    result = run_dtw_all_radii(gr, tw['TVT'].values, tw['GR'].values, radii=[20], k=4)
+    assert (result['dtw_r20_std'] >= 0).all()
+
+def test_dtw_cv_definition(hw, tw):
+    gr = hw['GR'].ffill().values[200:]
+    result = run_dtw_all_radii(gr, tw['TVT'].values, tw['GR'].values, radii=[20], k=3)
+    expected_cv = result['dtw_r20_std'] / (np.abs(result['dtw_r20_mean']) + 1e-6)
+    np.testing.assert_allclose(result['dtw_r20_cv'], expected_cv)
