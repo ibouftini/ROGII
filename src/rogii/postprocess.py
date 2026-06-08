@@ -72,3 +72,32 @@ def postprocess_well(
     tvt = savgol_smooth(tvt)
     tvt = apply_uspace(tvt, z, last_known_tvt, **uspace_cfg)
     return tvt
+
+
+import optuna
+
+
+def tune_postprocess(well_data: list[dict], n_trials: int = 500) -> dict:
+    """Optuna TPE over (alpha, tau, w_pf). well_data: per-well dicts with model outputs."""
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    def objective(trial: optuna.Trial) -> float:
+        alpha = trial.suggest_float('alpha', 0.5, 2.0)
+        tau   = trial.suggest_float('tau',   20.0, 200.0)
+        w_pf  = trial.suggest_float('w_pf',  0.0, 0.3)
+        total_sq, total_n = 0.0, 0
+        for wd in well_data:
+            d = blend_pf(wd['d_model'], wd['d_pf'], w_pf)
+            d = apply_rampup(d, wd['md_since_ps'], alpha, tau)
+            tvt_pred = wd['last_known_tvt'] + np.cumsum(d)
+            tvt_true = wd['last_known_tvt'] + np.cumsum(wd['target_increments'])
+            total_sq += float(np.sum((tvt_pred - tvt_true) ** 2))
+            total_n  += len(d)
+        return float(np.sqrt(total_sq / total_n))
+
+    study = optuna.create_study(
+        direction='minimize',
+        sampler=optuna.samplers.TPESampler(seed=42),
+    )
+    study.optimize(objective, n_trials=n_trials)
+    return study.best_params

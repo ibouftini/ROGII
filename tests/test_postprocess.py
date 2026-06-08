@@ -36,3 +36,22 @@ def test_uspace_smooth():
     out = apply_uspace(tvt, z, anchor_tvt=12050.0)
     # output should be smoother than input
     assert np.std(np.diff(out)) < np.std(np.diff(tvt))
+
+from rogii.postprocess import tune_postprocess
+
+def test_tune_returns_valid_params():
+    rng = np.random.default_rng(0)
+    n = 500
+    d_model = rng.normal(0.04, 0.02, n).clip(0)
+    d_pf    = rng.normal(0.04, 0.03, n).clip(0)
+    z       = np.linspace(-12100, -12150, n)
+    md      = np.arange(n, dtype=float)
+    target  = rng.normal(0.04, 0.02, n).clip(0)
+    # per-well info as single "well"
+    well_data = [dict(d_model=d_model, d_pf=d_pf, z=z,
+                      md_since_ps=md, last_known_tvt=12050.0,
+                      target_increments=target)]
+    params = tune_postprocess(well_data, n_trials=10)
+    assert 0.5 <= params['alpha'] <= 2.0
+    assert 20.0 <= params['tau'] <= 200.0
+    assert 0.0 <= params['w_pf'] <= 0.3
