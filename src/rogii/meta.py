@@ -1,6 +1,7 @@
 import numpy as np
 import lightgbm as lgb
 import xgboost as xgb
+import os, pickle
 
 
 def group_kfold(groups: np.ndarray, n_splits: int = 5) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -58,3 +59,53 @@ def train_catboost(
     model    = CatBoostRegressor(**params)
     model.fit(tr_pool, eval_set=val_pool, early_stopping_rounds=200)
     return model, model.predict(X_val)
+
+
+def ridge_stack(
+    oof_preds: dict[str, np.ndarray], y: np.ndarray, alpha: float = 1.0,
+) -> np.ndarray:
+    """Positive Ridge weights via projected gradient descent."""
+    names = list(oof_preds.keys())
+    X = np.column_stack([oof_preds[k] for k in names])   # (n, p)
+    p = X.shape[1]
+    A = np.vstack([X, np.sqrt(alpha) * np.eye(p)])
+    b = np.concatenate([y, np.zeros(p)])
+    AtA = A.T @ A
+    Atb = A.T @ b
+    lr = 1.0 / float(np.linalg.norm(AtA, ord=2))
+    w = np.ones(p) / p
+    for _ in range(2000):
+        w = np.maximum(0.0, w - lr * (AtA @ w - Atb))
+    return w
+
+
+def blend_predictions(
+    base_preds: np.ndarray,   # shape (n, n_models)
+    weights: np.ndarray,       # shape (n_models,)
+    pf_pred: np.ndarray,       # shape (n,)
+    w_pf: float = 0.70,
+) -> np.ndarray:
+    """0.30*Ridge_blend + 0.70*PF_heuristic."""
+    ridge_pred = base_preds @ weights
+    return (1.0 - w_pf) * ridge_pred + w_pf * pf_pred
+
+
+def save_models(models: dict, oof_preds: dict, out_dir: str) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    for name, model in models.items():
+        path = os.path.join(out_dir, f'{name}.pkl')
+        with open(path, 'wb') as f:
+            pickle.dump(model, f)
+    np.save(os.path.join(out_dir, 'oof_preds.npy'), oof_preds)
+
+
+def load_models(out_dir: str) -> tuple[dict, dict]:
+    models, oof_preds = {}, {}
+    for fn in os.listdir(out_dir):
+        if fn.endswith('.pkl'):
+            with open(os.path.join(out_dir, fn), 'rb') as f:
+                models[fn[:-4]] = pickle.load(f)
+    oof_path = os.path.join(out_dir, 'oof_preds.npy')
+    if os.path.exists(oof_path):
+        oof_preds = np.load(oof_path, allow_pickle=True).item()
+    return models, oof_preds

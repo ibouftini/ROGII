@@ -1,6 +1,8 @@
 import numpy as np
 import pytest
 from rogii.meta import group_kfold, train_lgb, train_xgb
+from rogii.meta import ridge_stack, blend_predictions, save_models, load_models
+import os, tempfile
 
 
 @pytest.fixture
@@ -41,3 +43,35 @@ def test_train_xgb_oof_shape(small_dataset):
                   device='cpu', seed=0, verbosity=0)
     model, oof = train_xgb(X[train_idx], y[train_idx], X[val_idx], y[val_idx], params)
     assert oof.shape == (len(val_idx),)
+
+
+def test_ridge_stack_weights_positive(small_dataset):
+    X, y, groups = small_dataset
+    oof_preds = {f'm{i}': np.random.default_rng(i).normal(0, 0.3, len(y)) for i in range(3)}
+    w = ridge_stack(oof_preds, y)
+    assert (w >= 0).all()
+    assert len(w) == 3
+
+
+def test_blend_shape(small_dataset):
+    X, y, groups = small_dataset
+    n = len(y)
+    base_preds = np.random.default_rng(0).normal(0, 0.1, (n, 3))
+    weights = np.array([0.4, 0.3, 0.3])
+    pf_pred = np.random.default_rng(1).normal(0, 0.1, n)
+    result = blend_predictions(base_preds, weights, pf_pred, w_pf=0.3)
+    assert result.shape == (n,)
+
+
+def test_save_load_roundtrip(small_dataset):
+    X, y, groups = small_dataset
+    folds = group_kfold(groups, 2)
+    tr, val = folds[0]
+    params = dict(num_leaves=15, learning_rate=0.1, n_estimators=20,
+                  verbose=-1, device='cpu')
+    model, oof = train_lgb(X[tr], y[tr], X[val], y[val], params)
+    with tempfile.TemporaryDirectory() as d:
+        save_models({'lgb0': model}, {'lgb0': oof}, d)
+        models, oofs = load_models(d)
+        assert 'lgb0' in models
+        assert 'lgb0' in oofs
