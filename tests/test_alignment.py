@@ -44,3 +44,29 @@ def test_beam_output_shape(hw, tw):
     gr = hw['GR'].ffill().values[200:]
     result = run_beam_configs(gr, tw['TVT'].values, tw['GR'].values, 12050.0, config.BEAM_CONFIGS)
     assert result['beam_ref'].shape == (n_eval,)
+
+
+import pytest
+from rogii.alignment.ncc import run_ncc_multiscale, compute_sc_trust
+
+def test_sc_trust_clip():
+    assert compute_sc_trust(0) == 0.0
+    assert compute_sc_trust(200) == pytest.approx(0.6)
+    assert compute_sc_trust(1000) == pytest.approx(0.6)  # clamped
+
+def test_ncc_multiscale_keys(hw, tw):
+    gr = hw['GR'].ffill().values
+    baseline = np.linspace(12050.0, 12400.0, len(hw) - 200)
+    result = run_ncc_multiscale(
+        gr, tw['TVT'].values, tw['GR'].values, baseline, known_rows=200
+    )
+    for key in ['sc8_tvt', 'sc15_tvt', 'sc25_tvt', 'sc_trust', 'hyb_ref']:
+        assert key in result
+
+def test_ncc_hyb_ref_formula(hw, tw):
+    gr = hw['GR'].ffill().values
+    baseline = np.linspace(12050.0, 12400.0, len(hw) - 200)
+    result = run_ncc_multiscale(gr, tw['TVT'].values, tw['GR'].values, baseline, known_rows=200)
+    sc_trust = result['sc_trust']
+    expected = (1 - sc_trust) * baseline + sc_trust * result['sc15_tvt']
+    np.testing.assert_allclose(result['hyb_ref'], expected)
