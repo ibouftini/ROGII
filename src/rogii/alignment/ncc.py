@@ -14,7 +14,8 @@ def compute_sc_trust(known_rows: int) -> float:
 
 def _run_single_scale(
     hw_gr: np.ndarray, tw_tvt: np.ndarray, tw_gr: np.ndarray,
-    baseline_tvt: np.ndarray, hw_size: int, stride: int, search_range: float = 50.0,
+    baseline_tvt: np.ndarray, hw_size: int, stride: int,
+    known_rows: int = 0, search_range: float = 50.0,
 ) -> tuple[np.ndarray, float]:
     n = len(baseline_tvt)
     offsets = np.arange(-search_range, search_range + 0.5, 0.5)
@@ -22,7 +23,8 @@ def _run_single_scale(
     confs = []
 
     for i in range(0, n, stride):
-        lo, hi = max(0, i - hw_size), min(len(hw_gr), i + hw_size + hw_size + 1)
+        center = known_rows + i
+        lo, hi = max(0, center - hw_size), min(len(hw_gr), center + hw_size + 1)
         hw_win = hw_gr[lo:hi]
         if np.isnan(hw_win).mean() > 0.5:
             confs.append(0.0)
@@ -49,7 +51,7 @@ def run_ncc_multiscale(
 ) -> dict[str, np.ndarray | float]:
     results: dict = {}
     for hw_size in hw_sizes:
-        traj, conf = _run_single_scale(hw_gr, tw_tvt, tw_gr, baseline_tvt, hw_size, stride)
+        traj, conf = _run_single_scale(hw_gr, tw_tvt, tw_gr, baseline_tvt, hw_size, stride, known_rows)
         results[f'sc{hw_size}_tvt'] = traj
         results[f'sc{hw_size}_conf'] = conf
     sc_trust = compute_sc_trust(known_rows)
