@@ -28,3 +28,17 @@ def test_knn_same_cluster_only():
     result = knn.predict(cluster_id=0, x=1.0, y=0.0)
     # should not be influenced by C1 wells (999.0)
     assert result['ANCC'] < 100.0
+
+import pandas as pd
+from rogii.neighbors import build_typewell_index, find_tw_match
+
+def test_same_tw_matches(tw):
+    index = {'|'.join(f'{v:.1f}' for v in tw['GR'].dropna().values[:50]): 'well_A'}
+    match = find_tw_match(tw, index)
+    assert match == 'well_A'
+
+def test_different_tw_no_match(tw):
+    tw2 = tw.copy()
+    tw2['GR'] = tw2['GR'] + 1000.0
+    index = {'|'.join(f'{v:.1f}' for v in tw['GR'].dropna().values[:50]): 'well_A'}
+    assert find_tw_match(tw2, index) is None
