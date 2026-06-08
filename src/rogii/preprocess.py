@@ -6,7 +6,7 @@ from scipy.ndimage import label as _label
 def detect_ps(hw: pd.DataFrame) -> int:
     """Index of first NaN in TVT_input. Returns len(hw) if no NaN."""
     mask = hw['TVT_input'].isna()
-    return int(mask.idxmax()) if mask.any() else len(hw)
+    return int(mask.to_numpy().argmax()) if mask.any() else len(hw)
 
 
 def interpolate_gr(hw: pd.DataFrame) -> pd.DataFrame:
