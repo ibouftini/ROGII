@@ -40,7 +40,7 @@ class FormationPlaneKNN:
             cluster_id = 0
         k = min(self.k, len(self._xy[cluster_id]))
         dists, idx = self._trees[cluster_id].query([[x, y]], k=k)
-        dists, idx = dists[0], idx[0]
+        dists, idx = np.atleast_1d(dists[0]), np.atleast_1d(idx[0])
         w = 1.0 / (dists + 1e-6)
         w /= w.sum()
         avg = (self._depths[cluster_id][idx] * w[:, None]).sum(axis=0)
