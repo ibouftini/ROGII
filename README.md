@@ -8,33 +8,46 @@ Kaggle competition: predicting TVT (True Vertical Thickness) along horizontal we
 
 ```bash
 pip install -r requirements.txt
+```
+
+### 2. Make `rogii` importable — pick one
+
+**Option A — editable install (installs the package once):**
+```bash
 pip install -e .
+python run.py --mode train
 ```
 
-### 2. Verify the setup
-
+**Option B — no install needed (set path at runtime):**
 ```bash
-conda run -n base python3 -m pytest tests/ -q
+PYTHONPATH=src python run.py --mode train
 ```
 
-Expected: 51 passed, 1 skipped.
+Both are equivalent. Option B requires no extra step if you're just copying files to a server.
 
-### 3. Train on labeled wells
+### 3. Verify the setup
 
 ```bash
-conda run -n base python3 run.py --mode train --data_dir data/train --out_dir models/
+PYTHONPATH=src python -m pytest tests/ -q
+# expected: 51 passed, 1 skipped
 ```
 
-### 4. Predict on eval wells
+### 4. Train on labeled wells
 
 ```bash
-conda run -n base python3 run.py --mode predict --data_dir data/test --model_dir models/ --out submission.csv
+PYTHONPATH=src python run.py --mode train
 ```
 
-### 5. Bundle source into a single Kaggle notebook file
+### 5. Predict on eval wells
 
 ```bash
-conda run -n base python3 scripts/bundle.py
+PYTHONPATH=src python run.py --mode predict
+```
+
+### 6. Bundle source into a single Kaggle notebook file
+
+```bash
+PYTHONPATH=src python scripts/bundle.py
 # outputs: notebooks/rogii.py
 ```
 
