@@ -50,11 +50,11 @@ def _dtw_stochastic_single(
 
 def run_dtw_all_radii(
     hw_gr: np.ndarray, tw_tvt: np.ndarray, tw_gr: np.ndarray,
-    radii: tuple | list = (20, 50, 100, 200), k: int = 12,
+    radii: tuple | list = (20, 50, 100, 200), k_stochastic: int = 12,
 ) -> dict[str, np.ndarray]:
     results = {}
     for r in radii:
-        paths = _dtw_stochastic_single(hw_gr, tw_tvt, tw_gr, r, k, seed=r)
+        paths = _dtw_stochastic_single(hw_gr, tw_tvt, tw_gr, r, k_stochastic, seed=r)
         mean = paths.mean(axis=0)
         std  = paths.std(axis=0)
         cv   = std / (np.abs(mean) + 1e-6)
