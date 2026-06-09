@@ -26,23 +26,28 @@ def compute_anchor_offsets(
     baseline_tvt: np.ndarray, tw_tvt: np.ndarray, tw_gr: np.ndarray,
     hw_gr: np.ndarray, window: int = 10,
 ) -> pd.DataFrame:
-    """NCC at each of 11 TVT offsets around the baseline prediction."""
-    n = len(baseline_tvt)
-    result = np.zeros((n, len(ANCHOR_OFFSETS)))
-
-    def _ncc(a: np.ndarray, b: np.ndarray) -> float:
-        a, b = a - a.mean(), b - b.mean()
-        d = np.sqrt((a ** 2).sum() * (b ** 2).sum())
-        return float(np.dot(a, b) / d) if d > 1e-8 else 0.0
+    """NCC at each of 11 TVT offsets — all offsets computed in one numpy batch per row."""
+    n           = len(baseline_tvt)
+    result      = np.zeros((n, len(ANCHOR_OFFSETS)))
+    offsets_arr = np.array(ANCHOR_OFFSETS, dtype=float)   # (11,)
 
     for i in range(n):
         lo, hi = max(0, i - window), min(n, i + window + 1)
         hw_win = hw_gr[lo:hi]
-        for j, off in enumerate(ANCHOR_OFFSETS):
-            cand = baseline_tvt[i] + off
-            pts = np.linspace(cand - window * 0.5, cand + window * 0.5, len(hw_win))
-            tw_win = np.interp(pts, tw_tvt, tw_gr)
-            result[i, j] = _ncc(hw_win, tw_win)
+        W = len(hw_win)
+        if W == 0:
+            continue
+
+        # All 11 candidate windows at once — (11, W)
+        rel_pts = np.linspace(-window * 0.5, window * 0.5, W)
+        cands   = baseline_tvt[i] + offsets_arr              # (11,)
+        all_pts = cands[:, None] + rel_pts[None, :]           # (11, W)
+        tw_wins = np.interp(all_pts.ravel(), tw_tvt, tw_gr).reshape(11, W)
+
+        hw_c  = hw_win - hw_win.mean()
+        tw_c  = tw_wins - tw_wins.mean(axis=1, keepdims=True)
+        denom = np.sqrt((hw_c ** 2).sum() * (tw_c ** 2).sum(axis=1))
+        result[i] = np.where(denom > 1e-8, tw_c @ hw_c / denom, 0.0)
 
     cols = [f'anchor_off_{o:+d}' for o in ANCHOR_OFFSETS]
     return pd.DataFrame(result, columns=cols)

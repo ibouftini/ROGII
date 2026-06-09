@@ -1,13 +1,6 @@
 import numpy as np
 
 
-def _ncc(a: np.ndarray, b: np.ndarray) -> float:
-    a = a - a.mean()
-    b = b - b.mean()
-    denom = np.sqrt((a ** 2).sum() * (b ** 2).sum())
-    return float(np.dot(a, b) / denom) if denom > 1e-8 else 0.0
-
-
 def compute_sc_trust(known_rows: int) -> float:
     return float(np.clip(known_rows / 200.0, 0.0, 0.6))
 
@@ -17,29 +10,37 @@ def _run_single_scale(
     baseline_tvt: np.ndarray, hw_size: int, stride: int,
     known_rows: int = 0, search_range: float = 50.0,
 ) -> tuple[np.ndarray, float]:
-    n = len(baseline_tvt)
-    offsets = np.arange(-search_range, search_range + 0.5, 0.5)
+    offsets = np.arange(-search_range, search_range + 0.5, 0.5)   # (201,)
+    n   = len(baseline_tvt)
     traj = baseline_tvt.copy()
     confs = []
 
     for i in range(0, n, stride):
         center = known_rows + i
-        lo, hi = max(0, center - hw_size), min(len(hw_gr), center + hw_size + 1)
+        lo = max(0, center - hw_size)
+        hi = min(len(hw_gr), center + hw_size + 1)
         hw_win = hw_gr[lo:hi]
-        if np.isnan(hw_win).mean() > 0.5:
+        W = len(hw_win)
+
+        if W == 0 or np.isnan(hw_win).mean() > 0.5:
             confs.append(0.0)
             continue
-        best, best_tvt = -np.inf, baseline_tvt[i]
-        for off in offsets:
-            cand = baseline_tvt[i] + off
-            pts = np.linspace(cand - hw_size * 0.5, cand + hw_size * 0.5, len(hw_win))
-            tw_win = np.interp(pts, tw_tvt, tw_gr)
-            score = _ncc(hw_win, tw_win)
-            if score > best:
-                best, best_tvt = score, cand
+
+        # Vectorise all 201 offset candidates at once — (201, W)
+        rel_pts = np.linspace(-hw_size * 0.5, hw_size * 0.5, W)
+        cands   = baseline_tvt[i] + offsets                         # (201,)
+        all_pts = cands[:, None] + rel_pts[None, :]                  # (201, W)
+        tw_wins = np.interp(all_pts.ravel(), tw_tvt, tw_gr).reshape(len(offsets), W)
+
+        hw_c  = hw_win - hw_win.mean()                               # (W,)
+        tw_c  = tw_wins - tw_wins.mean(axis=1, keepdims=True)        # (201, W)
+        denom = np.sqrt((hw_c ** 2).sum() * (tw_c ** 2).sum(axis=1))
+        scores = np.where(denom > 1e-8, tw_c @ hw_c / denom, 0.0)   # (201,)
+
+        best_idx = int(np.argmax(scores))
         end = min(n, i + stride)
-        traj[i:end] = best_tvt
-        confs.append(best)
+        traj[i:end] = cands[best_idx]
+        confs.append(float(scores[best_idx]))
 
     return traj, float(np.mean(confs)) if confs else 0.0
 
