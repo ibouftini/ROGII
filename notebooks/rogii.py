@@ -30,23 +30,28 @@ def compute_anchor_offsets(
     baseline_tvt: np.ndarray, tw_tvt: np.ndarray, tw_gr: np.ndarray,
     hw_gr: np.ndarray, window: int = 10,
 ) -> pd.DataFrame:
-    """NCC at each of 11 TVT offsets around the baseline prediction."""
-    n = len(baseline_tvt)
-    result = np.zeros((n, len(ANCHOR_OFFSETS)))
-
-    def _ncc(a: np.ndarray, b: np.ndarray) -> float:
-        a, b = a - a.mean(), b - b.mean()
-        d = np.sqrt((a ** 2).sum() * (b ** 2).sum())
-        return float(np.dot(a, b) / d) if d > 1e-8 else 0.0
+    """NCC at each of 11 TVT offsets — all offsets computed in one numpy batch per row."""
+    n           = len(baseline_tvt)
+    result      = np.zeros((n, len(ANCHOR_OFFSETS)))
+    offsets_arr = np.array(ANCHOR_OFFSETS, dtype=float)   # (11,)
 
     for i in range(n):
         lo, hi = max(0, i - window), min(n, i + window + 1)
         hw_win = hw_gr[lo:hi]
-        for j, off in enumerate(ANCHOR_OFFSETS):
-            cand = baseline_tvt[i] + off
-            pts = np.linspace(cand - window * 0.5, cand + window * 0.5, len(hw_win))
-            tw_win = np.interp(pts, tw_tvt, tw_gr)
-            result[i, j] = _ncc(hw_win, tw_win)
+        W = len(hw_win)
+        if W == 0:
+            continue
+
+        # All 11 candidate windows at once — (11, W)
+        rel_pts = np.linspace(-window * 0.5, window * 0.5, W)
+        cands   = baseline_tvt[i] + offsets_arr              # (11,)
+        all_pts = cands[:, None] + rel_pts[None, :]           # (11, W)
+        tw_wins = np.interp(all_pts.ravel(), tw_tvt, tw_gr).reshape(11, W)
+
+        hw_c  = hw_win - hw_win.mean()
+        tw_c  = tw_wins - tw_wins.mean(axis=1, keepdims=True)
+        denom = np.sqrt((hw_c ** 2).sum() * (tw_c ** 2).sum(axis=1))
+        result[i] = (tw_c @ hw_c) / np.maximum(denom, 1e-8)
 
     cols = [f'anchor_off_{o:+d}' for o in ANCHOR_OFFSETS]
     return pd.DataFrame(result, columns=cols)
@@ -153,13 +158,17 @@ def build_feature_matrix(
 
     df = pd.concat([df_align, df_anchor, df_form, df_gr, df_tab], axis=1)
 
-    # target: TVT increment
-    tvt = hw['TVT'].values
-    tvt_eval = tvt[ps_idx:]
-    tvt_prev = np.concatenate([[tvt[ps_idx - 1]], tvt_eval[:-1]])
-    y = tvt_eval - tvt_prev
+    # target: TVT increment (None for test wells that have no TVT label)
+    if 'TVT' in hw.columns:
+        tvt      = hw['TVT'].values
+        tvt_eval = tvt[ps_idx:]
+        first_prev = tvt[ps_idx - 1] if ps_idx > 0 else tvt_eval[0]
+        tvt_prev = np.concatenate([[first_prev], tvt_eval[:-1]])
+        y = (tvt_eval - tvt_prev).astype(np.float32)
+    else:
+        y = np.zeros(len(hw) - ps_idx, dtype=np.float32)
 
-    return df.values.astype(np.float32), y.astype(np.float32)
+    return df.values.astype(np.float32), y
 
 
 # --- src/rogii/meta.py ---
@@ -193,7 +202,7 @@ def train_lgb(
     dval   = lgb.Dataset(X_val, label=y_val)
     model  = lgb.train(
         p, dtrain, num_boost_round=n_est, valid_sets=[dval],
-        callbacks=[lgb.early_stopping(200, verbose=False), lgb.log_evaluation(500)],
+        callbacks=[lgb.early_stopping(200, verbose=False), lgb.log_evaluation(0)],
     )
     return model, model.predict(X_val)
 
@@ -209,7 +218,7 @@ def train_xgb(
     dval   = xgb.DMatrix(X_val, label=y_val)
     model  = xgb.train(p, dtrain, num_boost_round=n_est,
                        evals=[(dval, 'val')], early_stopping_rounds=200,
-                       verbose_eval=500)
+                       verbose_eval=False)
     return model, model.predict(xgb.DMatrix(X_val))
 
 
@@ -333,7 +342,7 @@ def _tw_signature(tw: pd.DataFrame, n: int = 50) -> str:
 
 def build_typewell_index(well_pairs: list[tuple[str, str]]) -> dict[str, str]:
     """Build {signature: wellname} from training well pairs (hw_path, tw_path)."""
-    from rogii.utils import extract_wellname, load_tw
+#     from rogii.utils import extract_wellname, load_tw  # bundled
     index = {}
     for hw_path, tw_path in well_pairs:
         tw = load_tw(tw_path)
@@ -588,22 +597,35 @@ def _run_single(
     hw_gr: np.ndarray, tw_tvt: np.ndarray, tw_gr: np.ndarray,
     tvt_start: float, step_max: float, penalty: float, beam_width: int = 20,
 ) -> np.ndarray:
-    steps = np.linspace(0.0, step_max, 15)
-    beam = [(0.0, tvt_start)]   # (score, tvt)
+    steps    = np.linspace(0.0, step_max, 15)
+    pen_cost = penalty * steps ** 2          # (15,) precomputed
+
+    beam_tvts   = np.array([tvt_start])
+    beam_scores = np.array([0.0])
     traj = np.empty(len(hw_gr))
 
     for t in range(len(hw_gr)):
         obs = hw_gr[t]
-        cands = []
-        for score, last_tvt in beam:
-            for s in steps:
-                new_tvt = last_tvt + s
-                pred = float(np.interp(new_tvt, tw_tvt, tw_gr))
-                gr_cost = (obs - pred) ** 2 if not np.isnan(obs) else 0.0
-                cands.append((score - gr_cost - penalty * s ** 2, new_tvt))
-        cands.sort(reverse=True)
-        beam = cands[:beam_width]
-        traj[t] = beam[0][1]
+        B   = len(beam_tvts)
+
+        # Expand all beam × step combinations in one shot — (B, 15)
+        cand_tvts   = beam_tvts[:, None] + steps[None, :]
+        preds       = np.interp(cand_tvts.ravel(), tw_tvt, tw_gr).reshape(B, 15)
+        gr_cost     = 0.0 if np.isnan(obs) else (obs - preds) ** 2
+        cand_scores = beam_scores[:, None] - gr_cost - pen_cost[None, :]
+
+        flat_scores = cand_scores.ravel()
+        flat_tvts   = cand_tvts.ravel()
+
+        # O(N) partial-sort instead of O(N log N) full sort
+        if len(flat_scores) > beam_width:
+            top = np.argpartition(flat_scores, -beam_width)[-beam_width:]
+        else:
+            top = np.arange(len(flat_scores))
+
+        beam_scores = flat_scores[top]
+        beam_tvts   = flat_tvts[top]
+        traj[t]     = beam_tvts[np.argmax(beam_scores)]
 
     return traj
 
@@ -628,14 +650,31 @@ import numpy as np
 
 
 def _fill_cost_matrix(x: np.ndarray, y: np.ndarray, radius: int) -> np.ndarray:
+    """DTW cost matrix via anti-diagonal vectorisation.
+
+    Processes each anti-diagonal (all cells with i+j=const) as a single numpy
+    operation, reducing Python iterations from O(N*M) to O(N+M).
+    Dependencies (i-1,j), (i,j-1), (i-1,j-1) always fall on earlier diagonals.
+    """
     n, m = len(x), len(y)
     D = np.full((n + 1, m + 1), np.inf)
     D[0, 0] = 0.0
-    for i in range(1, n + 1):
-        j_lo, j_hi = max(1, i - radius), min(m, i + radius)
-        for j in range(j_lo, j_hi + 1):
-            cost = (x[i - 1] - y[j - 1]) ** 2
-            D[i, j] = cost + min(D[i - 1, j], D[i, j - 1], D[i - 1, j - 1])
+    for d in range(n + m - 1):
+        # 1-indexed cells on this diagonal: i+j = d+2
+        i_lo = max(1, d + 2 - m)
+        i_hi = min(n, d + 1)
+        i_v = np.arange(i_lo, i_hi + 1)
+        j_v = d + 2 - i_v
+        # Sakoe-Chiba band
+        band = np.abs(i_v - j_v) <= radius
+        i_v, j_v = i_v[band], j_v[band]
+        if len(i_v) == 0:
+            continue
+        c = (x[i_v - 1] - y[j_v - 1]) ** 2
+        D[i_v, j_v] = c + np.minimum(
+            np.minimum(D[i_v - 1, j_v], D[i_v, j_v - 1]),
+            D[i_v - 1, j_v - 1],
+        )
     return D
 
 
@@ -676,11 +715,11 @@ def _dtw_stochastic_single(
 
 def run_dtw_all_radii(
     hw_gr: np.ndarray, tw_tvt: np.ndarray, tw_gr: np.ndarray,
-    radii: tuple | list = (20, 50, 100, 200), k: int = 12,
+    radii: tuple | list = (20, 50, 100, 200), k_stochastic: int = 4,
 ) -> dict[str, np.ndarray]:
     results = {}
     for r in radii:
-        paths = _dtw_stochastic_single(hw_gr, tw_tvt, tw_gr, r, k, seed=r)
+        paths = _dtw_stochastic_single(hw_gr, tw_tvt, tw_gr, r, k_stochastic, seed=r)
         mean = paths.mean(axis=0)
         std  = paths.std(axis=0)
         cv   = std / (np.abs(mean) + 1e-6)
@@ -694,13 +733,6 @@ def run_dtw_all_radii(
 import numpy as np
 
 
-def _ncc(a: np.ndarray, b: np.ndarray) -> float:
-    a = a - a.mean()
-    b = b - b.mean()
-    denom = np.sqrt((a ** 2).sum() * (b ** 2).sum())
-    return float(np.dot(a, b) / denom) if denom > 1e-8 else 0.0
-
-
 def compute_sc_trust(known_rows: int) -> float:
     return float(np.clip(known_rows / 200.0, 0.0, 0.6))
 
@@ -710,29 +742,37 @@ def _run_single_scale(
     baseline_tvt: np.ndarray, hw_size: int, stride: int,
     known_rows: int = 0, search_range: float = 50.0,
 ) -> tuple[np.ndarray, float]:
-    n = len(baseline_tvt)
-    offsets = np.arange(-search_range, search_range + 0.5, 0.5)
+    offsets = np.arange(-search_range, search_range + 0.5, 0.5)   # (201,)
+    n   = len(baseline_tvt)
     traj = baseline_tvt.copy()
     confs = []
 
     for i in range(0, n, stride):
         center = known_rows + i
-        lo, hi = max(0, center - hw_size), min(len(hw_gr), center + hw_size + 1)
+        lo = max(0, center - hw_size)
+        hi = min(len(hw_gr), center + hw_size + 1)
         hw_win = hw_gr[lo:hi]
-        if np.isnan(hw_win).mean() > 0.5:
+        W = len(hw_win)
+
+        if W == 0 or np.isnan(hw_win).mean() > 0.5:
             confs.append(0.0)
             continue
-        best, best_tvt = -np.inf, baseline_tvt[i]
-        for off in offsets:
-            cand = baseline_tvt[i] + off
-            pts = np.linspace(cand - hw_size * 0.5, cand + hw_size * 0.5, len(hw_win))
-            tw_win = np.interp(pts, tw_tvt, tw_gr)
-            score = _ncc(hw_win, tw_win)
-            if score > best:
-                best, best_tvt = score, cand
+
+        # Vectorise all 201 offset candidates at once — (201, W)
+        rel_pts = np.linspace(-hw_size * 0.5, hw_size * 0.5, W)
+        cands   = baseline_tvt[i] + offsets                         # (201,)
+        all_pts = cands[:, None] + rel_pts[None, :]                  # (201, W)
+        tw_wins = np.interp(all_pts.ravel(), tw_tvt, tw_gr).reshape(len(offsets), W)
+
+        hw_c  = hw_win - hw_win.mean()                               # (W,)
+        tw_c  = tw_wins - tw_wins.mean(axis=1, keepdims=True)        # (201, W)
+        denom = np.sqrt((hw_c ** 2).sum() * (tw_c ** 2).sum(axis=1))
+        scores = (tw_c @ hw_c) / np.maximum(denom, 1e-8)   # (201,)
+
+        best_idx = int(np.argmax(scores))
         end = min(n, i + stride)
-        traj[i:end] = best_tvt
-        confs.append(best)
+        traj[i:end] = cands[best_idx]
+        confs.append(float(scores[best_idx]))
 
     return traj, float(np.mean(confs)) if confs else 0.0
 
@@ -763,60 +803,54 @@ def _resample(weights: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     return np.searchsorted(np.cumsum(weights), pos)
 
 
-def _run_single(
+def _run_batch(
     hw_gr: np.ndarray, tw_tvt: np.ndarray, tw_gr: np.ndarray,
     tvt_start: float, n_particles: int, sigma_0: float,
-    gr_scale: int, obs_sigma: float, seed: int, use_velocity: bool,
+    gr_scale: int, obs_sigma: float, n_seeds: int, use_velocity: bool,
 ) -> np.ndarray:
-    rng = np.random.default_rng(seed)
+    """Run all n_seeds instances in one vectorised pass (S, P) → mean trajectory.
+
+    Replaces n_seeds sequential Python function calls with a single T-step loop
+    operating on (n_seeds, n_particles) arrays. Python loop overhead: O(T) instead
+    of O(n_seeds * T).
+    """
+    rng = np.random.default_rng(0)
     k = np.ones(gr_scale) / gr_scale
     hw_s = np.convolve(hw_gr, k, 'same')
     tw_s = np.convolve(tw_gr, k, 'same')
+    T, S, P = len(hw_gr), n_seeds, n_particles
 
-    tvt_p = rng.normal(tvt_start, sigma_0, n_particles)
-    vel_p = rng.normal(0.04, 0.02, n_particles).clip(0.0) if use_velocity else None
-    log_w = np.zeros(n_particles)
-    traj = np.empty(len(hw_gr))
+    tvt_p = rng.normal(tvt_start, sigma_0, (S, P))
+    log_w = np.zeros((S, P))
+    traj  = np.empty((S, T))
+    vel_p = rng.normal(0.04, 0.02, (S, P)).clip(0.0) if use_velocity else None
 
-    for t in range(len(hw_gr)):
+    for t in range(T):
         if use_velocity:
-            vel_p = (vel_p + rng.normal(0, 0.005, n_particles)).clip(0.0)
+            vel_p = (vel_p + rng.normal(0, 0.005, (S, P))).clip(0.0)
             tvt_p = tvt_p + vel_p
         else:
-            tvt_p += np.clip(rng.normal(0.04, 0.3, n_particles), 0.0, None)
+            tvt_p += np.clip(rng.normal(0.04, 0.3, (S, P)), 0.0, None)
 
         if not np.isnan(hw_s[t]):
-            pred = np.interp(tvt_p, tw_tvt, tw_s)
+            pred = np.interp(tvt_p.ravel(), tw_tvt, tw_s).reshape(S, P)
             log_w += -0.5 * ((hw_s[t] - pred) / obs_sigma) ** 2
 
-        log_w -= np.max(log_w)
+        log_w -= log_w.max(axis=1, keepdims=True)
         w = np.exp(log_w)
-        w /= w.sum()
-        traj[t] = tvt_p @ w
+        w /= w.sum(axis=1, keepdims=True)
+        traj[:, t] = (tvt_p * w).sum(axis=1)
 
-        if 1.0 / (w @ w) < n_particles / 2:
-            idx = _resample(w, rng)
-            tvt_p = tvt_p[idx]
+        ess = 1.0 / (w * w).sum(axis=1)
+        for s in np.where(ess < P / 2)[0]:
+            pos = (rng.random() + np.arange(P)) / P
+            idx = np.searchsorted(w[s].cumsum(), pos)
+            tvt_p[s] = tvt_p[s, idx]
             if use_velocity:
-                vel_p = vel_p[idx]
-            log_w = np.zeros(n_particles)
+                vel_p[s] = vel_p[s, idx]
+            log_w[s] = 0.0
 
-    return traj
-
-
-def run_pf(
-    hw_gr: np.ndarray, tw_tvt: np.ndarray, tw_gr: np.ndarray,
-    tvt_start: float, n_particles: int = 500, sigma_0: float = 4.5,
-    gr_scale: int = 5, obs_sigma: float = 15.0, n_seeds: int = 64,
-    use_velocity: bool = False,
-) -> np.ndarray:
-    """Ensemble PF. Averages n_seeds runs."""
-    trajs = [
-        _run_single(hw_gr, tw_tvt, tw_gr, tvt_start, n_particles,
-                    sigma_0, gr_scale, obs_sigma, s, use_velocity)
-        for s in range(n_seeds)
-    ]
-    return np.mean(trajs, axis=0)
+    return traj.mean(axis=0)
 
 
 def run_pf_variants(
@@ -825,19 +859,55 @@ def run_pf_variants(
 ) -> dict[str, np.ndarray]:
     """Run pf_ancc (position) and pf_z (velocity) variants over all GR scales."""
     n_p, s0, scales, n_s = cfg['n_particles'], cfg['sigma_0'], cfg['gr_scales'], cfg['n_seeds']
-    pf_ancc = np.mean([run_pf(hw_gr, tw_tvt, tw_gr, tvt_start, n_p, s0, sc, n_seeds=n_s)
-                       for sc in scales], axis=0)
-    pf_z    = np.mean([run_pf(hw_gr, tw_tvt, tw_gr, tvt_start, n_p, s0, sc, n_seeds=n_s,
-                               use_velocity=True)
-                       for sc in scales], axis=0)
+    pf_ancc = np.mean([
+        _run_batch(hw_gr, tw_tvt, tw_gr, tvt_start, n_p, s0, sc, 15.0, n_s, False)
+        for sc in scales
+    ], axis=0)
+    pf_z = np.mean([
+        _run_batch(hw_gr, tw_tvt, tw_gr, tvt_start, n_p, s0, sc, 15.0, n_s, True)
+        for sc in scales
+    ], axis=0)
     return {'pf_ancc': pf_ancc, 'pf_z': pf_z}
 
 
 # --- src/rogii/pipeline.py ---
 import os
+import time
+import hashlib
+import pickle
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
+from tqdm import tqdm
+
+
+# ---------------------------------------------------------------------------
+# Disk cache helpers
+# ---------------------------------------------------------------------------
+
+def _cfg_hash(cfg) -> str:
+    """8-char hash of alignment+feature config. Cache invalidates on any change."""
+    key = str((cfg.PF, cfg.BEAM_CONFIGS, cfg.NCC, cfg.DTW, cfg.FEATURES))
+    return hashlib.md5(key.encode()).hexdigest()[:8]
+
+
+def _cache_path(cache_dir: str, name: str, h: str) -> str:
+    return os.path.join(cache_dir, f'{name}_{h}.pkl')
+
+
+def _save_cache(path: str, data: tuple) -> None:
+    with open(path, 'wb') as f:
+        pickle.dump(data, f, protocol=4)
+
+
+def _load_cache(path: str) -> tuple | None:
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+    except Exception:
+        return None
 
 # from rogii.utils import WellData, load_hw, load_tw, list_wells, extract_wellname  # bundled
 # from rogii.preprocess import detect_ps, interpolate_gr, calibrate_gr, extract_scalars  # bundled
@@ -854,6 +924,8 @@ from joblib import Parallel, delayed
 # from rogii.meta import group_kfold, train_lgb, train_xgb, train_catboost  # bundled
 # from rogii.meta import ridge_stack, blend_predictions, save_models, load_models  # bundled
 # from rogii.postprocess import postprocess_well, tune_postprocess  # bundled
+
+_BAR_FMT = '{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
 
 
 def process_well(
@@ -916,104 +988,235 @@ def _build_knn(train_pairs: list, cfg) -> FormationPlaneKNN:
     return FormationPlaneKNN(k=10).fit(wells)
 
 
+def _sep(char='=', width=65):
+    tqdm.write(char * width)
+
+
 def run_pipeline(cfg, mode: str = 'train',
                  train_dir: str = None, test_dir: str = None,
                  models_dir: str = None) -> pd.DataFrame | None:
+    t_start = time.time()
     train_dir  = train_dir  or cfg.DATA['train_dir']
     test_dir   = test_dir   or cfg.DATA['test_dir']
     models_dir = models_dir or cfg.DATA['models_dir']
     os.makedirs(models_dir, exist_ok=True)
 
+    _sep()
+    tqdm.write(f'  ROGII Wellbore Geology Pipeline  |  mode: {mode.upper()}')
+    _sep()
+
     train_pairs = list_wells(train_dir)
-    knn         = _build_knn(train_pairs, cfg)
-    tw_index    = build_typewell_index(train_pairs)
+    tqdm.write(f'  train dir  : {train_dir}  ({len(train_pairs)} wells)')
+
+    tqdm.write(f'\n[setup] Building FormationPlaneKNN + typewell index ...')
+    t0 = time.time()
+    knn      = _build_knn(train_pairs, cfg)
+    tw_index = build_typewell_index(train_pairs)
+    tqdm.write(f'[setup] Done  ({time.time()-t0:.1f}s)  k=10, {len(train_pairs)} anchor wells')
+
+    # Cache setup — invalidates automatically when alignment/feature config changes
+    cache_dir = cfg.DATA.get('cache_dir', 'data/cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    cfg_h = _cfg_hash(cfg)
+    n_cached = sum(
+        1 for hp, _ in train_pairs
+        if os.path.exists(_cache_path(cache_dir, extract_wellname(hp), cfg_h))
+    )
+    tqdm.write(f'[cache] {n_cached}/{len(train_pairs)} wells cached  '
+               f'(dir={cache_dir}/  hash={cfg_h})')
+
+    def _get_alignment(wd: WellData) -> dict:
+        """Return alignment from disk cache or compute and save it."""
+        cpath = _cache_path(cache_dir, wd.name, cfg_h)
+        aln   = _load_cache(cpath)
+        if aln is None:
+            aln = _compute_alignment(wd, cfg)
+            _save_cache(cpath, aln)
+        return aln
 
     def _load_and_process(hw_path, tw_path):
         name = extract_wellname(hw_path)
         hw   = load_hw(hw_path)
         tw   = load_tw(tw_path)
         wd   = process_well(name, hw, tw, knn, tw_index, cfg)
-        aln  = _compute_alignment(wd, cfg)
+        aln  = _get_alignment(wd)
         X, y = _well_to_rows(wd, aln, cfg)
-        pf   = aln['pf_ancc']
-        return wd.name, X, y, pf, wd.scalars
+        return wd.name, X, y, aln['pf_ancc'], wd.scalars
 
     if mode == 'train':
-        results = Parallel(n_jobs=-1)(
-            delayed(_load_and_process)(hp, tp) for hp, tp in train_pairs
+        tqdm.write(f'\n[1/4] Well processing  (PF × 256 runs + Beam × 7 + NCC × 3 + DTW × 4 per well) ...')
+        t0 = time.time()
+        results = list(tqdm(
+            Parallel(n_jobs=-1, return_as='generator')(
+                delayed(_load_and_process)(hp, tp) for hp, tp in train_pairs
+            ),
+            total=len(train_pairs),
+            desc='  wells',
+            unit='well',
+            bar_format=_BAR_FMT,
+            ncols=80,
+        ))
+        tqdm.write(f'[1/4] Done  ({time.time()-t0:.1f}s)')
+
+        names  = [r[0] for r in results]
+        X_all  = np.vstack([r[1] for r in results])
+        y_all  = np.concatenate([r[2] for r in results])
+        groups = np.concatenate([np.full(len(r[1]), i) for i, r in enumerate(results)])
+        pf_all = np.concatenate([r[3] for r in results])
+
+        n_wells = len(np.unique(groups))
+        tqdm.write(
+            f'\n[2/4] Feature matrix  :  {X_all.shape[0]:,} rows × {X_all.shape[1]} cols'
+            f'  ({n_wells} wells,  y μ={y_all.mean():.4f}  σ={y_all.std():.4f})'
         )
-        names   = [r[0] for r in results]
-        X_all   = np.vstack([r[1] for r in results])
-        y_all   = np.concatenate([r[2] for r in results])
-        groups  = np.concatenate([np.full(len(r[1]), i) for i, r in enumerate(results)])
-        pf_all  = np.concatenate([r[3] for r in results])
 
         folds    = group_kfold(groups, cfg.CV['n_splits'])
         oof_dict = {}
         models   = {}
 
+        tqdm.write(f'\n[3/4] Ensemble training  ({cfg.CV["n_splits"]}-fold GroupKFold) ...')
+        _sep('-')
+        t_train = time.time()
+
+        # --- LightGBM variants ---
         for i, lparams in enumerate(cfg.LGB_VARIANTS):
             oof = np.zeros(len(y_all))
             fold_models = []
-            for tr_idx, val_idx in folds:
+            desc = f'  LGB-{i}  leaves={lparams["num_leaves"]} lr={lparams["learning_rate"]}'
+            bar  = tqdm(enumerate(folds), total=len(folds), desc=desc,
+                        unit='fold', bar_format=_BAR_FMT, ncols=80)
+            for fold_j, (tr_idx, val_idx) in bar:
                 m, pred = train_lgb(X_all[tr_idx], y_all[tr_idx],
                                     X_all[val_idx], y_all[val_idx], lparams.copy())
                 oof[val_idx] = pred
                 fold_models.append(m)
+                rmse = float(np.sqrt(np.mean((pred - y_all[val_idx]) ** 2)))
+                bar.set_postfix(fold=f'{fold_j+1}/{len(folds)}', val_rmse=f'{rmse:.5f}')
+            oof_rmse_i = float(np.sqrt(np.mean((oof - y_all) ** 2)))
+            tqdm.write(f'    LGB-{i}  OOF RMSE: {oof_rmse_i:.5f}')
             oof_dict[f'lgb{i}'] = oof
-            models[f'lgb{i}'] = fold_models[-1]
+            for fi, fm in enumerate(fold_models):
+                models[f'lgb{i}_f{fi}'] = fm
 
+        # --- XGBoost ---
         xgb_oof = np.zeros(len(y_all))
-        for tr_idx, val_idx in folds:
+        xgb_fold_models = []
+        desc = f'  XGB    depth={cfg.XGB["max_depth"]} lr={cfg.XGB["learning_rate"]}'
+        bar  = tqdm(enumerate(folds), total=len(folds), desc=desc,
+                    unit='fold', bar_format=_BAR_FMT, ncols=80)
+        for fold_j, (tr_idx, val_idx) in bar:
             m, pred = train_xgb(X_all[tr_idx], y_all[tr_idx],
                                  X_all[val_idx], y_all[val_idx], cfg.XGB.copy())
             xgb_oof[val_idx] = pred
+            xgb_fold_models.append(m)
+            rmse = float(np.sqrt(np.mean((pred - y_all[val_idx]) ** 2)))
+            bar.set_postfix(fold=f'{fold_j+1}/{len(folds)}', val_rmse=f'{rmse:.5f}')
+        oof_rmse_xgb = float(np.sqrt(np.mean((xgb_oof - y_all) ** 2)))
+        tqdm.write(f'    XGB    OOF RMSE: {oof_rmse_xgb:.5f}')
         oof_dict['xgb'] = xgb_oof
-        models['xgb'] = m
+        for fi, fm in enumerate(xgb_fold_models):
+            models[f'xgb_f{fi}'] = fm
 
+        # --- CatBoost ---
         cat_feat_idx = []
         cb_oof = np.zeros(len(y_all))
-        for tr_idx, val_idx in folds:
+        cb_fold_models = []
+        desc = f'  CatBoost depth={cfg.CATBOOST["depth"]} lr={cfg.CATBOOST["learning_rate"]}'
+        bar  = tqdm(enumerate(folds), total=len(folds), desc=desc,
+                    unit='fold', bar_format=_BAR_FMT, ncols=80)
+        for fold_j, (tr_idx, val_idx) in bar:
             m, pred = train_catboost(X_all[tr_idx], y_all[tr_idx],
                                      X_all[val_idx], y_all[val_idx],
                                      cfg.CATBOOST.copy(), cat_feat_idx)
             cb_oof[val_idx] = pred
+            cb_fold_models.append(m)
+            rmse = float(np.sqrt(np.mean((pred - y_all[val_idx]) ** 2)))
+            bar.set_postfix(fold=f'{fold_j+1}/{len(folds)}', val_rmse=f'{rmse:.5f}')
+        oof_rmse_cb = float(np.sqrt(np.mean((cb_oof - y_all) ** 2)))
+        tqdm.write(f'    CatBoost OOF RMSE: {oof_rmse_cb:.5f}')
         oof_dict['catboost'] = cb_oof
-        models['catboost'] = m
+        for fi, fm in enumerate(cb_fold_models):
+            models[f'catboost_f{fi}'] = fm
 
+        _sep('-')
+        tqdm.write(f'[3/4] Training done  ({time.time()-t_train:.1f}s)')
+
+        # --- Ridge stacking ---
+        tqdm.write(f'\n[4/4] Ridge stacking  (NNLS, alpha={cfg.RIDGE["alpha"]}) ...')
         stack_w = ridge_stack(oof_dict, y_all, cfg.RIDGE['alpha'])
+        model_names = list(oof_dict.keys())
+        weight_str  = '  '.join(f'{n}={w:.3f}' for n, w in zip(model_names, stack_w))
+        tqdm.write(f'       weights →  {weight_str}')
+
         save_models(models, {'oof': oof_dict, 'stack_w': stack_w}, models_dir)
+
         oof_rmse = float(np.sqrt(np.mean(
             (y_all - np.column_stack(list(oof_dict.values())) @ stack_w) ** 2
         )))
-        print(f'OOF increment RMSE: {oof_rmse:.4f}')
+
+        _sep()
+        tqdm.write(f'  OOF increment RMSE (stacked) : {oof_rmse:.5f}')
+        tqdm.write(f'  Per-model OOF RMSE           : '
+                   + '  '.join(f'{n}={v:.4f}' for n, v in [
+                       (f'lgb{i}', float(np.sqrt(np.mean((oof_dict[f"lgb{i}"] - y_all)**2))))
+                       for i in range(len(cfg.LGB_VARIANTS))
+                   ] + [
+                       ('xgb',      float(np.sqrt(np.mean((xgb_oof  - y_all)**2)))),
+                       ('catboost', float(np.sqrt(np.mean((cb_oof   - y_all)**2)))),
+                   ]))
+        tqdm.write(f'  Models saved to              : {models_dir}/')
+        tqdm.write(f'  Total elapsed                : {time.time()-t_start:.1f}s')
+        _sep()
         return None
 
     elif mode == 'predict':
         test_pairs = list_wells(test_dir)
+        tqdm.write(f'  test  dir  : {test_dir}  ({len(test_pairs)} wells)')
+
+        tqdm.write(f'\n[1/2] Loading models from {models_dir}/ ...')
         loaded_models, meta = load_models(models_dir)
         stack_w = meta.get('stack_w', np.array([1.0]))
+        tqdm.write(f'[1/2] Loaded {len(loaded_models)} model files')
+
+        n_test_cached = sum(
+            1 for hp, _ in test_pairs
+            if os.path.exists(_cache_path(cache_dir, extract_wellname(hp), cfg_h))
+        )
+        tqdm.write(f'[cache] {n_test_cached}/{len(test_pairs)} test wells cached')
+
+        tqdm.write(f'\n[2/2] Running inference on {len(test_pairs)} test wells ...')
+        t0 = time.time()
         rows = []
-        for hp, tp in test_pairs:
+        for hp, tp in tqdm(test_pairs, desc='  test wells', unit='well',
+                           bar_format=_BAR_FMT, ncols=80):
             name = extract_wellname(hp)
             hw   = load_hw(hp)
             tw   = load_tw(tp)
             wd   = process_well(name, hw, tw, knn, tw_index, cfg)
-            aln  = _compute_alignment(wd, cfg)
+            aln  = _get_alignment(wd)        # cache hit → instant; miss → compute+save
             X, _ = _well_to_rows(wd, aln, cfg)
+
+            from collections import defaultdict as _dd
+            import xgboost as xgb_lib
+            fold_groups: dict = _dd(list)
+            for mname in loaded_models:
+                base_name = mname.rsplit('_f', 1)[0] if '_f' in mname else mname
+                fold_groups[base_name].append(mname)
             preds = []
-            for mname in sorted(loaded_models):
-                m = loaded_models[mname]
-                if hasattr(m, 'predict'):
-                    import xgboost as xgb_lib
+            for base_name in sorted(fold_groups):
+                fold_preds = []
+                for mname in fold_groups[base_name]:
+                    m = loaded_models[mname]
                     if isinstance(m, xgb_lib.Booster):
-                        preds.append(m.predict(xgb_lib.DMatrix(X)))
+                        fold_preds.append(m.predict(xgb_lib.DMatrix(X)))
                     else:
-                        preds.append(m.predict(X))
+                        fold_preds.append(m.predict(X))
+                preds.append(np.mean(fold_preds, axis=0))
             if not preds:
+                tqdm.write(f'  [warn] no predictions for {name}, skipping')
                 continue
-            base = np.column_stack(preds)
-            pf_d = np.diff(np.concatenate([[wd.scalars['last_known_tvt']], aln['pf_ancc']]))
+            base    = np.column_stack(preds)
+            pf_d    = np.diff(np.concatenate([[wd.scalars['last_known_tvt']], aln['pf_ancc']]))
             d_blend = blend_predictions(base, stack_w[:base.shape[1]], pf_d, cfg.BLEND['w_pf'])
             z_eval  = wd.hw.iloc[wd.ps_idx:]['Z'].values
             md_eval = wd.hw.iloc[wd.ps_idx:]['MD'].values
@@ -1027,6 +1230,15 @@ def run_pipeline(cfg, mode: str = 'train',
             for idx, tvt_val in zip(eval_hw.index, tvt_pred):
                 row_md = int(wd.hw.loc[idx, 'MD'])
                 rows.append({'id': f'{name}_{row_md}', 'tvt': tvt_val})
-        return pd.DataFrame(rows)
+
+        df_out = pd.DataFrame(rows)
+        _sep()
+        tqdm.write(f'  Predictions  : {len(df_out):,} rows  ({len(test_pairs)} wells)')
+        tqdm.write(f'  TVT range    : [{df_out["tvt"].min():.2f}, {df_out["tvt"].max():.2f}]  '
+                   f'mean={df_out["tvt"].mean():.2f}')
+        tqdm.write(f'  Inference time : {time.time()-t0:.1f}s')
+        tqdm.write(f'  Total elapsed  : {time.time()-t_start:.1f}s')
+        _sep()
+        return df_out
 
     return pd.DataFrame()

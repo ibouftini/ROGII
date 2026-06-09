@@ -28,11 +28,12 @@ def collect_files(root: str) -> list[str]:
 
 def strip_relative_imports(src: str) -> str:
     lines = []
-    depth = 0  # open paren depth within a rogii import block
+    depth = 0
     in_rogii_import = False
     for line in src.splitlines():
+        stripped = line.lstrip()
         if not in_rogii_import and (
-            line.startswith('from rogii') or line.startswith('import rogii')
+            stripped.startswith('from rogii') or stripped.startswith('import rogii')
         ):
             in_rogii_import = True
             depth = line.count('(') - line.count(')')
