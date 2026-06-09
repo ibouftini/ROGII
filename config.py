@@ -1,5 +1,5 @@
 # config.py
-PF = dict(n_particles=500, sigma_0=4.5, gr_scales=[3, 5, 8, 12], n_seeds=64)
+PF = dict(n_particles=500, sigma_0=4.5, gr_scales=[5, 8], n_seeds=16)
 
 BEAM_CONFIGS = [
     dict(name='vcons',  step_max=0.3, penalty=8.0),
@@ -12,7 +12,7 @@ BEAM_CONFIGS = [
 ]
 
 NCC = dict(hw_sizes=[8, 15, 25], stride=3)
-DTW = dict(radii=[20, 50, 100, 200], k_stochastic=12)
+DTW = dict(radii=[20, 50, 100, 200], k_stochastic=4)
 
 FEATURES = dict(
     anchor_offsets=[-80, -40, -20, -10, -5, 0, 5, 10, 20, 40, 80],

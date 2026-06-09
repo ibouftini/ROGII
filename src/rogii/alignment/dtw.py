@@ -2,14 +2,31 @@ import numpy as np
 
 
 def _fill_cost_matrix(x: np.ndarray, y: np.ndarray, radius: int) -> np.ndarray:
+    """DTW cost matrix via anti-diagonal vectorisation.
+
+    Processes each anti-diagonal (all cells with i+j=const) as a single numpy
+    operation, reducing Python iterations from O(N*M) to O(N+M).
+    Dependencies (i-1,j), (i,j-1), (i-1,j-1) always fall on earlier diagonals.
+    """
     n, m = len(x), len(y)
     D = np.full((n + 1, m + 1), np.inf)
     D[0, 0] = 0.0
-    for i in range(1, n + 1):
-        j_lo, j_hi = max(1, i - radius), min(m, i + radius)
-        for j in range(j_lo, j_hi + 1):
-            cost = (x[i - 1] - y[j - 1]) ** 2
-            D[i, j] = cost + min(D[i - 1, j], D[i, j - 1], D[i - 1, j - 1])
+    for d in range(n + m - 1):
+        # 1-indexed cells on this diagonal: i+j = d+2
+        i_lo = max(1, d + 2 - m)
+        i_hi = min(n, d + 1)
+        i_v = np.arange(i_lo, i_hi + 1)
+        j_v = d + 2 - i_v
+        # Sakoe-Chiba band
+        band = np.abs(i_v - j_v) <= radius
+        i_v, j_v = i_v[band], j_v[band]
+        if len(i_v) == 0:
+            continue
+        c = (x[i_v - 1] - y[j_v - 1]) ** 2
+        D[i_v, j_v] = c + np.minimum(
+            np.minimum(D[i_v - 1, j_v], D[i_v, j_v - 1]),
+            D[i_v - 1, j_v - 1],
+        )
     return D
 
 
@@ -50,7 +67,7 @@ def _dtw_stochastic_single(
 
 def run_dtw_all_radii(
     hw_gr: np.ndarray, tw_tvt: np.ndarray, tw_gr: np.ndarray,
-    radii: tuple | list = (20, 50, 100, 200), k_stochastic: int = 12,
+    radii: tuple | list = (20, 50, 100, 200), k_stochastic: int = 4,
 ) -> dict[str, np.ndarray]:
     results = {}
     for r in radii:
