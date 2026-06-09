@@ -28,7 +28,7 @@ def train_lgb(
     dval   = lgb.Dataset(X_val, label=y_val)
     model  = lgb.train(
         p, dtrain, num_boost_round=n_est, valid_sets=[dval],
-        callbacks=[lgb.early_stopping(200, verbose=False), lgb.log_evaluation(500)],
+        callbacks=[lgb.early_stopping(200, verbose=False), lgb.log_evaluation(0)],
     )
     return model, model.predict(X_val)
 
@@ -44,7 +44,7 @@ def train_xgb(
     dval   = xgb.DMatrix(X_val, label=y_val)
     model  = xgb.train(p, dtrain, num_boost_round=n_est,
                        evals=[(dval, 'val')], early_stopping_rounds=200,
-                       verbose_eval=500)
+                       verbose_eval=False)
     return model, model.predict(xgb.DMatrix(X_val))
 
 

@@ -1,7 +1,9 @@
 import os
+import time
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
+from tqdm import tqdm
 
 from rogii.utils import WellData, load_hw, load_tw, list_wells, extract_wellname
 from rogii.preprocess import detect_ps, interpolate_gr, calibrate_gr, extract_scalars
@@ -18,6 +20,8 @@ from rogii.features import (build_alignment_df, compute_anchor_offsets,
 from rogii.meta import group_kfold, train_lgb, train_xgb, train_catboost
 from rogii.meta import ridge_stack, blend_predictions, save_models, load_models
 from rogii.postprocess import postprocess_well, tune_postprocess
+
+_BAR_FMT = '{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
 
 
 def process_well(
@@ -80,17 +84,31 @@ def _build_knn(train_pairs: list, cfg) -> FormationPlaneKNN:
     return FormationPlaneKNN(k=10).fit(wells)
 
 
+def _sep(char='=', width=65):
+    tqdm.write(char * width)
+
+
 def run_pipeline(cfg, mode: str = 'train',
                  train_dir: str = None, test_dir: str = None,
                  models_dir: str = None) -> pd.DataFrame | None:
+    t_start = time.time()
     train_dir  = train_dir  or cfg.DATA['train_dir']
     test_dir   = test_dir   or cfg.DATA['test_dir']
     models_dir = models_dir or cfg.DATA['models_dir']
     os.makedirs(models_dir, exist_ok=True)
 
+    _sep()
+    tqdm.write(f'  ROGII Wellbore Geology Pipeline  |  mode: {mode.upper()}')
+    _sep()
+
     train_pairs = list_wells(train_dir)
-    knn         = _build_knn(train_pairs, cfg)
-    tw_index    = build_typewell_index(train_pairs)
+    tqdm.write(f'  train dir  : {train_dir}  ({len(train_pairs)} wells)')
+
+    tqdm.write(f'\n[setup] Building FormationPlaneKNN + typewell index ...')
+    t0 = time.time()
+    knn      = _build_knn(train_pairs, cfg)
+    tw_index = build_typewell_index(train_pairs)
+    tqdm.write(f'[setup] Done  ({time.time()-t0:.1f}s)  k=10, {len(train_pairs)} anchor wells')
 
     def _load_and_process(hw_path, tw_path):
         name = extract_wellname(hw_path)
@@ -103,76 +121,152 @@ def run_pipeline(cfg, mode: str = 'train',
         return wd.name, X, y, pf, wd.scalars
 
     if mode == 'train':
-        results = Parallel(n_jobs=-1)(
-            delayed(_load_and_process)(hp, tp) for hp, tp in train_pairs
+        tqdm.write(f'\n[1/4] Well processing  (PF × 256 runs + Beam × 7 + NCC × 3 + DTW × 4 per well) ...')
+        t0 = time.time()
+        results = list(tqdm(
+            Parallel(n_jobs=-1, return_as='generator')(
+                delayed(_load_and_process)(hp, tp) for hp, tp in train_pairs
+            ),
+            total=len(train_pairs),
+            desc='  wells',
+            unit='well',
+            bar_format=_BAR_FMT,
+            ncols=80,
+        ))
+        tqdm.write(f'[1/4] Done  ({time.time()-t0:.1f}s)')
+
+        names  = [r[0] for r in results]
+        X_all  = np.vstack([r[1] for r in results])
+        y_all  = np.concatenate([r[2] for r in results])
+        groups = np.concatenate([np.full(len(r[1]), i) for i, r in enumerate(results)])
+        pf_all = np.concatenate([r[3] for r in results])
+
+        n_wells = len(np.unique(groups))
+        tqdm.write(
+            f'\n[2/4] Feature matrix  :  {X_all.shape[0]:,} rows × {X_all.shape[1]} cols'
+            f'  ({n_wells} wells,  y μ={y_all.mean():.4f}  σ={y_all.std():.4f})'
         )
-        names   = [r[0] for r in results]
-        X_all   = np.vstack([r[1] for r in results])
-        y_all   = np.concatenate([r[2] for r in results])
-        groups  = np.concatenate([np.full(len(r[1]), i) for i, r in enumerate(results)])
-        pf_all  = np.concatenate([r[3] for r in results])
 
         folds    = group_kfold(groups, cfg.CV['n_splits'])
         oof_dict = {}
         models   = {}
 
+        tqdm.write(f'\n[3/4] Ensemble training  ({cfg.CV["n_splits"]}-fold GroupKFold) ...')
+        _sep('-')
+        t_train = time.time()
+
+        # --- LightGBM variants ---
         for i, lparams in enumerate(cfg.LGB_VARIANTS):
             oof = np.zeros(len(y_all))
             fold_models = []
-            for tr_idx, val_idx in folds:
+            desc = f'  LGB-{i}  leaves={lparams["num_leaves"]} lr={lparams["learning_rate"]}'
+            bar  = tqdm(enumerate(folds), total=len(folds), desc=desc,
+                        unit='fold', bar_format=_BAR_FMT, ncols=80)
+            for fold_j, (tr_idx, val_idx) in bar:
                 m, pred = train_lgb(X_all[tr_idx], y_all[tr_idx],
                                     X_all[val_idx], y_all[val_idx], lparams.copy())
                 oof[val_idx] = pred
                 fold_models.append(m)
+                rmse = float(np.sqrt(np.mean((pred - y_all[val_idx]) ** 2)))
+                bar.set_postfix(fold=f'{fold_j+1}/{len(folds)}', val_rmse=f'{rmse:.5f}')
+            oof_rmse_i = float(np.sqrt(np.mean((oof - y_all) ** 2)))
+            tqdm.write(f'    LGB-{i}  OOF RMSE: {oof_rmse_i:.5f}')
             oof_dict[f'lgb{i}'] = oof
             for fi, fm in enumerate(fold_models):
                 models[f'lgb{i}_f{fi}'] = fm
 
+        # --- XGBoost ---
         xgb_oof = np.zeros(len(y_all))
         xgb_fold_models = []
-        for tr_idx, val_idx in folds:
+        desc = f'  XGB    depth={cfg.XGB["max_depth"]} lr={cfg.XGB["learning_rate"]}'
+        bar  = tqdm(enumerate(folds), total=len(folds), desc=desc,
+                    unit='fold', bar_format=_BAR_FMT, ncols=80)
+        for fold_j, (tr_idx, val_idx) in bar:
             m, pred = train_xgb(X_all[tr_idx], y_all[tr_idx],
                                  X_all[val_idx], y_all[val_idx], cfg.XGB.copy())
             xgb_oof[val_idx] = pred
             xgb_fold_models.append(m)
+            rmse = float(np.sqrt(np.mean((pred - y_all[val_idx]) ** 2)))
+            bar.set_postfix(fold=f'{fold_j+1}/{len(folds)}', val_rmse=f'{rmse:.5f}')
+        oof_rmse_xgb = float(np.sqrt(np.mean((xgb_oof - y_all) ** 2)))
+        tqdm.write(f'    XGB    OOF RMSE: {oof_rmse_xgb:.5f}')
         oof_dict['xgb'] = xgb_oof
         for fi, fm in enumerate(xgb_fold_models):
             models[f'xgb_f{fi}'] = fm
 
+        # --- CatBoost ---
         cat_feat_idx = []
         cb_oof = np.zeros(len(y_all))
         cb_fold_models = []
-        for tr_idx, val_idx in folds:
+        desc = f'  CatBoost depth={cfg.CATBOOST["depth"]} lr={cfg.CATBOOST["learning_rate"]}'
+        bar  = tqdm(enumerate(folds), total=len(folds), desc=desc,
+                    unit='fold', bar_format=_BAR_FMT, ncols=80)
+        for fold_j, (tr_idx, val_idx) in bar:
             m, pred = train_catboost(X_all[tr_idx], y_all[tr_idx],
                                      X_all[val_idx], y_all[val_idx],
                                      cfg.CATBOOST.copy(), cat_feat_idx)
             cb_oof[val_idx] = pred
             cb_fold_models.append(m)
+            rmse = float(np.sqrt(np.mean((pred - y_all[val_idx]) ** 2)))
+            bar.set_postfix(fold=f'{fold_j+1}/{len(folds)}', val_rmse=f'{rmse:.5f}')
+        oof_rmse_cb = float(np.sqrt(np.mean((cb_oof - y_all) ** 2)))
+        tqdm.write(f'    CatBoost OOF RMSE: {oof_rmse_cb:.5f}')
         oof_dict['catboost'] = cb_oof
         for fi, fm in enumerate(cb_fold_models):
             models[f'catboost_f{fi}'] = fm
 
+        _sep('-')
+        tqdm.write(f'[3/4] Training done  ({time.time()-t_train:.1f}s)')
+
+        # --- Ridge stacking ---
+        tqdm.write(f'\n[4/4] Ridge stacking  (NNLS, alpha={cfg.RIDGE["alpha"]}) ...')
         stack_w = ridge_stack(oof_dict, y_all, cfg.RIDGE['alpha'])
+        model_names = list(oof_dict.keys())
+        weight_str  = '  '.join(f'{n}={w:.3f}' for n, w in zip(model_names, stack_w))
+        tqdm.write(f'       weights →  {weight_str}')
+
         save_models(models, {'oof': oof_dict, 'stack_w': stack_w}, models_dir)
+
         oof_rmse = float(np.sqrt(np.mean(
             (y_all - np.column_stack(list(oof_dict.values())) @ stack_w) ** 2
         )))
-        print(f'OOF increment RMSE: {oof_rmse:.4f}')
+
+        _sep()
+        tqdm.write(f'  OOF increment RMSE (stacked) : {oof_rmse:.5f}')
+        tqdm.write(f'  Per-model OOF RMSE           : '
+                   + '  '.join(f'{n}={v:.4f}' for n, v in [
+                       (f'lgb{i}', float(np.sqrt(np.mean((oof_dict[f"lgb{i}"] - y_all)**2))))
+                       for i in range(len(cfg.LGB_VARIANTS))
+                   ] + [
+                       ('xgb',      float(np.sqrt(np.mean((xgb_oof  - y_all)**2)))),
+                       ('catboost', float(np.sqrt(np.mean((cb_oof   - y_all)**2)))),
+                   ]))
+        tqdm.write(f'  Models saved to              : {models_dir}/')
+        tqdm.write(f'  Total elapsed                : {time.time()-t_start:.1f}s')
+        _sep()
         return None
 
     elif mode == 'predict':
         test_pairs = list_wells(test_dir)
+        tqdm.write(f'  test  dir  : {test_dir}  ({len(test_pairs)} wells)')
+
+        tqdm.write(f'\n[1/2] Loading models from {models_dir}/ ...')
         loaded_models, meta = load_models(models_dir)
         stack_w = meta.get('stack_w', np.array([1.0]))
+        tqdm.write(f'[1/2] Loaded {len(loaded_models)} model files')
+
+        tqdm.write(f'\n[2/2] Running inference on {len(test_pairs)} test wells ...')
+        t0 = time.time()
         rows = []
-        for hp, tp in test_pairs:
+        for hp, tp in tqdm(test_pairs, desc='  test wells', unit='well',
+                           bar_format=_BAR_FMT, ncols=80):
             name = extract_wellname(hp)
             hw   = load_hw(hp)
             tw   = load_tw(tp)
             wd   = process_well(name, hw, tw, knn, tw_index, cfg)
             aln  = _compute_alignment(wd, cfg)
             X, _ = _well_to_rows(wd, aln, cfg)
-            # group fold models by base name (lgb0_f0..fN → lgb0), average folds
+
             from collections import defaultdict as _dd
             import xgboost as xgb_lib
             fold_groups: dict = _dd(list)
@@ -190,9 +284,10 @@ def run_pipeline(cfg, mode: str = 'train',
                         fold_preds.append(m.predict(X))
                 preds.append(np.mean(fold_preds, axis=0))
             if not preds:
+                tqdm.write(f'  [warn] no predictions for {name}, skipping')
                 continue
-            base = np.column_stack(preds)
-            pf_d = np.diff(np.concatenate([[wd.scalars['last_known_tvt']], aln['pf_ancc']]))
+            base    = np.column_stack(preds)
+            pf_d    = np.diff(np.concatenate([[wd.scalars['last_known_tvt']], aln['pf_ancc']]))
             d_blend = blend_predictions(base, stack_w[:base.shape[1]], pf_d, cfg.BLEND['w_pf'])
             z_eval  = wd.hw.iloc[wd.ps_idx:]['Z'].values
             md_eval = wd.hw.iloc[wd.ps_idx:]['MD'].values
@@ -206,6 +301,15 @@ def run_pipeline(cfg, mode: str = 'train',
             for idx, tvt_val in zip(eval_hw.index, tvt_pred):
                 row_md = int(wd.hw.loc[idx, 'MD'])
                 rows.append({'id': f'{name}_{row_md}', 'tvt': tvt_val})
-        return pd.DataFrame(rows)
+
+        df_out = pd.DataFrame(rows)
+        _sep()
+        tqdm.write(f'  Predictions  : {len(df_out):,} rows  ({len(test_pairs)} wells)')
+        tqdm.write(f'  TVT range    : [{df_out["tvt"].min():.2f}, {df_out["tvt"].max():.2f}]  '
+                   f'mean={df_out["tvt"].mean():.2f}')
+        tqdm.write(f'  Inference time : {time.time()-t0:.1f}s')
+        tqdm.write(f'  Total elapsed  : {time.time()-t_start:.1f}s')
+        _sep()
+        return df_out
 
     return pd.DataFrame()

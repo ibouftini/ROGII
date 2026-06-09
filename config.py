@@ -29,7 +29,7 @@ LGB_VARIANTS = [
 ]
 
 CATBOOST = dict(depth=8, learning_rate=0.025, iterations=6000, l2_leaf_reg=2,
-                random_seed=42, task_type='GPU', verbose=500)
+                random_seed=42, task_type='GPU', verbose=0)
 
 XGB = dict(max_depth=8, learning_rate=0.04, reg_lambda=10, n_estimators=6000,
            device='cuda', seed=42)
