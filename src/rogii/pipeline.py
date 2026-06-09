@@ -125,25 +125,32 @@ def run_pipeline(cfg, mode: str = 'train',
                 oof[val_idx] = pred
                 fold_models.append(m)
             oof_dict[f'lgb{i}'] = oof
-            models[f'lgb{i}'] = fold_models[-1]
+            for fi, fm in enumerate(fold_models):
+                models[f'lgb{i}_f{fi}'] = fm
 
         xgb_oof = np.zeros(len(y_all))
+        xgb_fold_models = []
         for tr_idx, val_idx in folds:
             m, pred = train_xgb(X_all[tr_idx], y_all[tr_idx],
                                  X_all[val_idx], y_all[val_idx], cfg.XGB.copy())
             xgb_oof[val_idx] = pred
+            xgb_fold_models.append(m)
         oof_dict['xgb'] = xgb_oof
-        models['xgb'] = m
+        for fi, fm in enumerate(xgb_fold_models):
+            models[f'xgb_f{fi}'] = fm
 
         cat_feat_idx = []
         cb_oof = np.zeros(len(y_all))
+        cb_fold_models = []
         for tr_idx, val_idx in folds:
             m, pred = train_catboost(X_all[tr_idx], y_all[tr_idx],
                                      X_all[val_idx], y_all[val_idx],
                                      cfg.CATBOOST.copy(), cat_feat_idx)
             cb_oof[val_idx] = pred
+            cb_fold_models.append(m)
         oof_dict['catboost'] = cb_oof
-        models['catboost'] = m
+        for fi, fm in enumerate(cb_fold_models):
+            models[f'catboost_f{fi}'] = fm
 
         stack_w = ridge_stack(oof_dict, y_all, cfg.RIDGE['alpha'])
         save_models(models, {'oof': oof_dict, 'stack_w': stack_w}, models_dir)
@@ -165,15 +172,23 @@ def run_pipeline(cfg, mode: str = 'train',
             wd   = process_well(name, hw, tw, knn, tw_index, cfg)
             aln  = _compute_alignment(wd, cfg)
             X, _ = _well_to_rows(wd, aln, cfg)
+            # group fold models by base name (lgb0_f0..fN → lgb0), average folds
+            from collections import defaultdict as _dd
+            import xgboost as xgb_lib
+            fold_groups: dict = _dd(list)
+            for mname in loaded_models:
+                base_name = mname.rsplit('_f', 1)[0] if '_f' in mname else mname
+                fold_groups[base_name].append(mname)
             preds = []
-            for mname in sorted(loaded_models):
-                m = loaded_models[mname]
-                if hasattr(m, 'predict'):
-                    import xgboost as xgb_lib
+            for base_name in sorted(fold_groups):
+                fold_preds = []
+                for mname in fold_groups[base_name]:
+                    m = loaded_models[mname]
                     if isinstance(m, xgb_lib.Booster):
-                        preds.append(m.predict(xgb_lib.DMatrix(X)))
+                        fold_preds.append(m.predict(xgb_lib.DMatrix(X)))
                     else:
-                        preds.append(m.predict(X))
+                        fold_preds.append(m.predict(X))
+                preds.append(np.mean(fold_preds, axis=0))
             if not preds:
                 continue
             base = np.column_stack(preds)

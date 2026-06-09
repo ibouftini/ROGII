@@ -152,7 +152,8 @@ def build_feature_matrix(
     # target: TVT increment
     tvt = hw['TVT'].values
     tvt_eval = tvt[ps_idx:]
-    tvt_prev = np.concatenate([[tvt[ps_idx - 1]], tvt_eval[:-1]])
+    first_prev = tvt[ps_idx - 1] if ps_idx > 0 else tvt_eval[0]
+    tvt_prev = np.concatenate([[first_prev], tvt_eval[:-1]])
     y = tvt_eval - tvt_prev
 
     return df.values.astype(np.float32), y.astype(np.float32)
