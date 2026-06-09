@@ -6,3 +6,4 @@ lightgbm>=4.0
 xgboost>=2.0
 catboost>=1.2
 optuna>=3.4
+joblib>=1.3

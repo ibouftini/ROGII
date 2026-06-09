@@ -1,81 +1,76 @@
 # ROGII — Wellbore Geology Prediction
 
-Kaggle competition: predicting TVT (True Vertical Thickness) along horizontal wellbore eval zones using GR signal alignment feeding a GBDT meta-learner.
-
-## Quick Start
-
-### 1. Install dependencies
+## Setup
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Make `rogii` importable — pick one
+> `rogii` is not a published package — make it importable by prefixing commands with `PYTHONPATH=src`, **or** install it once with `pip install -e .`
 
-**Option A — editable install (installs the package once):**
-```bash
-pip install -e .
-python run.py --mode train
-```
+---
 
-**Option B — no install needed (set path at runtime):**
-```bash
-PYTHONPATH=src python run.py --mode train
-```
+## Run
 
-Both are equivalent. Option B requires no extra step if you're just copying files to a server.
-
-### 3. Verify the setup
-
-```bash
-PYTHONPATH=src python -m pytest tests/ -q
-# expected: 51 passed, 1 skipped
-```
-
-### 4. Train on labeled wells
+### 1. Train
 
 ```bash
 PYTHONPATH=src python run.py --mode train
 ```
 
-### 5. Predict on eval wells
+Trains LightGBM / XGBoost / CatBoost on `data/train/`, saves models to `models/`.
+
+### 2. Predict
 
 ```bash
 PYTHONPATH=src python run.py --mode predict
 ```
 
-### 6. Bundle source into a single Kaggle notebook file
+Runs inference on `data/test/`, writes **`submissions/submission.csv`**.
 
-```bash
-PYTHONPATH=src python scripts/bundle.py
-# outputs: notebooks/rogii.py
-```
+---
 
 ## Data layout
 
 ```
 data/
-  <hash>__horizontal_well.csv
-  <hash>__typewell.csv
+  train/
+    <hash>__horizontal_well.csv
+    <hash>__typewell.csv
+  test/
+    <hash>__horizontal_well.csv
+    <hash>__typewell.csv
 ```
+
+---
+
+## GPU note
+
+XGBoost and CatBoost use GPU by default (`config.py`).
+LightGBM requires a GPU build — install via conda for automatic CUDA detection:
+
+```bash
+conda install -c conda-forge lightgbm
+```
+
+---
 
 ## Project layout
 
 ```
 src/rogii/
-  utils.py          WellData, load helpers
-  preprocess.py     GR interpolation, affine calibration, scalar features
-  neighbors.py      cluster assignment, FormationPlaneKNN, typewell index
+  utils.py            WellData, load helpers
+  preprocess.py       GR interpolation, affine calibration, scalar features
+  neighbors.py        cluster assignment, FormationPlaneKNN, typewell index
   alignment/
     particle_filter.py
     beam.py
     ncc.py
     dtw.py
-  features.py       tabular feature matrix builder
-  meta.py           LGB/XGB/CatBoost training, Ridge stacking, CV
-  postprocess.py    ramp-up, U-space projection, Optuna tuning
-  pipeline.py       train / predict orchestration
-config.py           all hyperparameters
-run.py              CLI entry point
-scripts/bundle.py   Kaggle flat-file bundler
+  features.py         tabular feature matrix builder
+  meta.py             LGB/XGB/CatBoost training, Ridge stacking, CV
+  postprocess.py      ramp-up, U-space projection, Optuna tuning
+  pipeline.py         train / predict orchestration
+config.py             all hyperparameters
+run.py                CLI entry point
 ```
