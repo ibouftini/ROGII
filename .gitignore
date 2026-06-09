@@ -10,3 +10,8 @@ build/
 models/
 submissions/
 data/
+backup/
+.agents/
+CLAUDE.md
+skills-lock.json
+.pytest_cache/
