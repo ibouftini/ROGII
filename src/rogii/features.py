@@ -47,7 +47,7 @@ def compute_anchor_offsets(
         hw_c  = hw_win - hw_win.mean()
         tw_c  = tw_wins - tw_wins.mean(axis=1, keepdims=True)
         denom = np.sqrt((hw_c ** 2).sum() * (tw_c ** 2).sum(axis=1))
-        result[i] = np.where(denom > 1e-8, tw_c @ hw_c / denom, 0.0)
+        result[i] = (tw_c @ hw_c) / np.maximum(denom, 1e-8)
 
     cols = [f'anchor_off_{o:+d}' for o in ANCHOR_OFFSETS]
     return pd.DataFrame(result, columns=cols)

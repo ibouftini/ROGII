@@ -35,7 +35,7 @@ def _run_single_scale(
         hw_c  = hw_win - hw_win.mean()                               # (W,)
         tw_c  = tw_wins - tw_wins.mean(axis=1, keepdims=True)        # (201, W)
         denom = np.sqrt((hw_c ** 2).sum() * (tw_c ** 2).sum(axis=1))
-        scores = np.where(denom > 1e-8, tw_c @ hw_c / denom, 0.0)   # (201,)
+        scores = (tw_c @ hw_c) / np.maximum(denom, 1e-8)   # (201,)
 
         best_idx = int(np.argmax(scores))
         end = min(n, i + stride)
