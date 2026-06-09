@@ -7,7 +7,7 @@ dist/
 build/
 .env
 .venv/
-
+models/
 submissions/
 data/
 backup/
