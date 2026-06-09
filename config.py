@@ -41,4 +41,5 @@ USPACE = dict(degree=4, robust_iters=4, c=2.0)
 CV = dict(n_splits=5)
 
 DATA = dict(train_dir='data/train', test_dir='data/test',
-            models_dir='models', submissions_dir='submissions')
+            models_dir='models', submissions_dir='submissions',
+            cache_dir='data/cache')

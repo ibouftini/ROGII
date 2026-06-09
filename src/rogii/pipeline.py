@@ -1,9 +1,40 @@
 import os
 import time
+import hashlib
+import pickle
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
 from tqdm import tqdm
+
+
+# ---------------------------------------------------------------------------
+# Disk cache helpers
+# ---------------------------------------------------------------------------
+
+def _cfg_hash(cfg) -> str:
+    """8-char hash of alignment+feature config. Cache invalidates on any change."""
+    key = str((cfg.PF, cfg.BEAM_CONFIGS, cfg.NCC, cfg.DTW, cfg.FEATURES))
+    return hashlib.md5(key.encode()).hexdigest()[:8]
+
+
+def _cache_path(cache_dir: str, name: str, h: str) -> str:
+    return os.path.join(cache_dir, f'{name}_{h}.pkl')
+
+
+def _save_cache(path: str, data: tuple) -> None:
+    with open(path, 'wb') as f:
+        pickle.dump(data, f, protocol=4)
+
+
+def _load_cache(path: str) -> tuple | None:
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+    except Exception:
+        return None
 
 from rogii.utils import WellData, load_hw, load_tw, list_wells, extract_wellname
 from rogii.preprocess import detect_ps, interpolate_gr, calibrate_gr, extract_scalars
@@ -110,15 +141,34 @@ def run_pipeline(cfg, mode: str = 'train',
     tw_index = build_typewell_index(train_pairs)
     tqdm.write(f'[setup] Done  ({time.time()-t0:.1f}s)  k=10, {len(train_pairs)} anchor wells')
 
+    # Cache setup — invalidates automatically when alignment/feature config changes
+    cache_dir = cfg.DATA.get('cache_dir', 'data/cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    cfg_h = _cfg_hash(cfg)
+    n_cached = sum(
+        1 for hp, _ in train_pairs
+        if os.path.exists(_cache_path(cache_dir, extract_wellname(hp), cfg_h))
+    )
+    tqdm.write(f'[cache] {n_cached}/{len(train_pairs)} wells cached  '
+               f'(dir={cache_dir}/  hash={cfg_h})')
+
+    def _get_alignment(wd: WellData) -> dict:
+        """Return alignment from disk cache or compute and save it."""
+        cpath = _cache_path(cache_dir, wd.name, cfg_h)
+        aln   = _load_cache(cpath)
+        if aln is None:
+            aln = _compute_alignment(wd, cfg)
+            _save_cache(cpath, aln)
+        return aln
+
     def _load_and_process(hw_path, tw_path):
         name = extract_wellname(hw_path)
         hw   = load_hw(hw_path)
         tw   = load_tw(tw_path)
         wd   = process_well(name, hw, tw, knn, tw_index, cfg)
-        aln  = _compute_alignment(wd, cfg)
+        aln  = _get_alignment(wd)
         X, y = _well_to_rows(wd, aln, cfg)
-        pf   = aln['pf_ancc']
-        return wd.name, X, y, pf, wd.scalars
+        return wd.name, X, y, aln['pf_ancc'], wd.scalars
 
     if mode == 'train':
         tqdm.write(f'\n[1/4] Well processing  (PF × 256 runs + Beam × 7 + NCC × 3 + DTW × 4 per well) ...')
@@ -255,6 +305,12 @@ def run_pipeline(cfg, mode: str = 'train',
         stack_w = meta.get('stack_w', np.array([1.0]))
         tqdm.write(f'[1/2] Loaded {len(loaded_models)} model files')
 
+        n_test_cached = sum(
+            1 for hp, _ in test_pairs
+            if os.path.exists(_cache_path(cache_dir, extract_wellname(hp), cfg_h))
+        )
+        tqdm.write(f'[cache] {n_test_cached}/{len(test_pairs)} test wells cached')
+
         tqdm.write(f'\n[2/2] Running inference on {len(test_pairs)} test wells ...')
         t0 = time.time()
         rows = []
@@ -264,7 +320,7 @@ def run_pipeline(cfg, mode: str = 'train',
             hw   = load_hw(hp)
             tw   = load_tw(tp)
             wd   = process_well(name, hw, tw, knn, tw_index, cfg)
-            aln  = _compute_alignment(wd, cfg)
+            aln  = _get_alignment(wd)        # cache hit → instant; miss → compute+save
             X, _ = _well_to_rows(wd, aln, cfg)
 
             from collections import defaultdict as _dd
