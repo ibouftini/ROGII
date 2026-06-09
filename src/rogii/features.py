@@ -154,11 +154,14 @@ def build_feature_matrix(
 
     df = pd.concat([df_align, df_anchor, df_form, df_gr, df_tab], axis=1)
 
-    # target: TVT increment
-    tvt = hw['TVT'].values
-    tvt_eval = tvt[ps_idx:]
-    first_prev = tvt[ps_idx - 1] if ps_idx > 0 else tvt_eval[0]
-    tvt_prev = np.concatenate([[first_prev], tvt_eval[:-1]])
-    y = tvt_eval - tvt_prev
+    # target: TVT increment (None for test wells that have no TVT label)
+    if 'TVT' in hw.columns:
+        tvt      = hw['TVT'].values
+        tvt_eval = tvt[ps_idx:]
+        first_prev = tvt[ps_idx - 1] if ps_idx > 0 else tvt_eval[0]
+        tvt_prev = np.concatenate([[first_prev], tvt_eval[:-1]])
+        y = (tvt_eval - tvt_prev).astype(np.float32)
+    else:
+        y = np.zeros(len(hw) - ps_idx, dtype=np.float32)
 
-    return df.values.astype(np.float32), y.astype(np.float32)
+    return df.values.astype(np.float32), y
