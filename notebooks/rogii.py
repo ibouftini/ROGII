@@ -1013,8 +1013,7 @@ def _predict_one_well(hw_path, tw_path, knn, tw_index, loaded_models, stack_w,
     eval_hw = wd.hw.iloc[wd.ps_idx:]
     rows = []
     for idx, tvt_val in zip(eval_hw.index, tvt_pred):
-        row_md = int(wd.hw.loc[idx, 'MD'])
-        rows.append({'id': f'{name}_{row_md}', 'tvt': tvt_val})
+        rows.append({'id': f'{name}_{idx}', 'tvt': tvt_val})
     return rows
 
 
