@@ -2,39 +2,12 @@ import os
 import time
 import hashlib
 import pickle
+from collections import defaultdict
 import numpy as np
 import pandas as pd
+import xgboost as xgb_lib
 from joblib import Parallel, delayed
 from tqdm import tqdm
-
-
-# ---------------------------------------------------------------------------
-# Disk cache helpers
-# ---------------------------------------------------------------------------
-
-def _cfg_hash(cfg) -> str:
-    """8-char hash of alignment+feature config. Cache invalidates on any change."""
-    key = str((cfg.PF, cfg.BEAM_CONFIGS, cfg.NCC, cfg.DTW, cfg.FEATURES))
-    return hashlib.md5(key.encode()).hexdigest()[:8]
-
-
-def _cache_path(cache_dir: str, name: str, h: str) -> str:
-    return os.path.join(cache_dir, f'{name}_{h}.pkl')
-
-
-def _save_cache(path: str, data: tuple) -> None:
-    with open(path, 'wb') as f:
-        pickle.dump(data, f, protocol=4)
-
-
-def _load_cache(path: str) -> tuple | None:
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, 'rb') as f:
-            return pickle.load(f)
-    except Exception:
-        return None
 
 from rogii.utils import WellData, load_hw, load_tw, list_wells, extract_wellname
 from rogii.preprocess import detect_ps, interpolate_gr, calibrate_gr, extract_scalars
@@ -55,11 +28,43 @@ from rogii.postprocess import postprocess_well, tune_postprocess
 _BAR_FMT = '{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
 
 
+# ---------------------------------------------------------------------------
+# Disk cache helpers
+# ---------------------------------------------------------------------------
+
+def _cfg_hash(cfg) -> str:
+    """8-char hash of alignment+feature config. Cache invalidates on any change."""
+    key = str((cfg.PF, cfg.BEAM_CONFIGS, cfg.NCC, cfg.DTW, cfg.FEATURES))
+    return hashlib.md5(key.encode()).hexdigest()[:8]
+
+
+def _cache_path(cache_dir: str, name: str, h: str) -> str:
+    return os.path.join(cache_dir, f'{name}_{h}.pkl')
+
+
+def _save_cache(path: str, data) -> None:
+    with open(path, 'wb') as f:
+        pickle.dump(data, f, protocol=4)
+
+
+def _load_cache(path: str):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Well processing helpers
+# ---------------------------------------------------------------------------
+
 def process_well(
     name: str, hw: pd.DataFrame, tw: pd.DataFrame,
     knn: FormationPlaneKNN, tw_index: dict, cfg,
 ) -> WellData:
-    """Preprocess a single well: interpolate, calibrate, detect PS, extract scalars."""
     hw = interpolate_gr(hw)
     ps_idx = detect_ps(hw)
     a, b, hw = calibrate_gr(hw, tw, ps_idx)
@@ -78,7 +83,6 @@ def process_well(
 
 
 def _compute_alignment(wd: WellData, cfg) -> dict:
-    """Run all 4 alignment families for one well."""
     hw, tw = wd.hw, wd.tw
     ps = wd.ps_idx
     gr_eval = hw['GR'].values[ps:]
@@ -119,6 +123,87 @@ def _sep(char='=', width=65):
     tqdm.write(char * width)
 
 
+# ---------------------------------------------------------------------------
+# Module-level predict worker — must be at module scope for joblib pickling
+# ---------------------------------------------------------------------------
+
+def _predict_one_well(hw_path, tw_path, knn, tw_index, loaded_models, stack_w,
+                      cfg, cache_dir, cfg_h):
+    """Process one test well; returns list of {'id': ..., 'tvt': ...} dicts."""
+    name = extract_wellname(hw_path)
+    hw   = load_hw(hw_path)
+    tw   = load_tw(tw_path)
+    wd   = process_well(name, hw, tw, knn, tw_index, cfg)
+
+    cpath = _cache_path(cache_dir, wd.name, cfg_h)
+    aln   = _load_cache(cpath)
+    if aln is None:
+        aln = _compute_alignment(wd, cfg)
+        _save_cache(cpath, aln)
+
+    X, _ = _well_to_rows(wd, aln, cfg)
+
+    fold_groups: dict = defaultdict(list)
+    for mname in loaded_models:
+        base_name = mname.rsplit('_f', 1)[0] if '_f' in mname else mname
+        fold_groups[base_name].append(mname)
+
+    preds = []
+    for base_name in sorted(fold_groups):
+        fold_preds = []
+        for mname in fold_groups[base_name]:
+            m = loaded_models[mname]
+            if isinstance(m, xgb_lib.Booster):
+                fold_preds.append(m.predict(xgb_lib.DMatrix(X)))
+            else:
+                fold_preds.append(m.predict(X))
+        preds.append(np.mean(fold_preds, axis=0))
+
+    if not preds:
+        return []
+
+    base     = np.column_stack(preds)
+    pf_d     = np.diff(np.concatenate([[wd.scalars['last_known_tvt']], aln['pf_ancc']]))
+    d_blend  = blend_predictions(base, stack_w[:base.shape[1]], pf_d, cfg.BLEND['w_pf'])
+    z_eval   = wd.hw.iloc[wd.ps_idx:]['Z'].values
+    md_eval  = wd.hw.iloc[wd.ps_idx:]['MD'].values
+    tvt_pred = postprocess_well(
+        d_blend, pf_d, z_eval,
+        md_eval - md_eval[0],
+        wd.scalars['last_known_tvt'],
+        cfg.PP, cfg.USPACE,
+    )
+    eval_hw = wd.hw.iloc[wd.ps_idx:]
+    rows = []
+    for idx, tvt_val in zip(eval_hw.index, tvt_pred):
+        rows.append({'id': f'{name}_{idx}', 'tvt': tvt_val})
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Train worker — also at module scope for joblib
+# ---------------------------------------------------------------------------
+
+def _load_and_process(hw_path, tw_path, knn, tw_index, cfg, cache_dir, cfg_h):
+    name = extract_wellname(hw_path)
+    hw   = load_hw(hw_path)
+    tw   = load_tw(tw_path)
+    wd   = process_well(name, hw, tw, knn, tw_index, cfg)
+
+    cpath = _cache_path(cache_dir, wd.name, cfg_h)
+    aln   = _load_cache(cpath)
+    if aln is None:
+        aln = _compute_alignment(wd, cfg)
+        _save_cache(cpath, aln)
+
+    X, y = _well_to_rows(wd, aln, cfg)
+    return wd.name, X, y, aln['pf_ancc'], wd.scalars
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
 def run_pipeline(cfg, mode: str = 'train',
                  train_dir: str = None, test_dir: str = None,
                  models_dir: str = None) -> pd.DataFrame | None:
@@ -135,47 +220,44 @@ def run_pipeline(cfg, mode: str = 'train',
     train_pairs = list_wells(train_dir)
     tqdm.write(f'  train dir  : {train_dir}  ({len(train_pairs)} wells)')
 
-    tqdm.write(f'\n[setup] Building FormationPlaneKNN + typewell index ...')
-    t0 = time.time()
-    knn      = _build_knn(train_pairs, cfg)
-    tw_index = build_typewell_index(train_pairs)
-    tqdm.write(f'[setup] Done  ({time.time()-t0:.1f}s)  k=10, {len(train_pairs)} anchor wells')
-
-    # Cache setup — invalidates automatically when alignment/feature config changes
     cache_dir = cfg.DATA.get('cache_dir', 'data/cache')
     os.makedirs(cache_dir, exist_ok=True)
     cfg_h = _cfg_hash(cfg)
+
+    # KNN / typewell index: load saved artefacts if present, else build from scratch
+    knn_path = os.path.join(models_dir, 'knn.pkl')
+    twi_path = os.path.join(models_dir, 'tw_index.pkl')
+
+    if mode == 'predict' and os.path.exists(knn_path) and os.path.exists(twi_path):
+        with open(knn_path, 'rb') as f:
+            knn = pickle.load(f)
+        with open(twi_path, 'rb') as f:
+            tw_index = pickle.load(f)
+        tqdm.write(f'[setup] KNN + typewell index loaded from {models_dir}/')
+    else:
+        tqdm.write(f'\n[setup] Building FormationPlaneKNN + typewell index ...')
+        t0 = time.time()
+        knn      = _build_knn(train_pairs, cfg)
+        tw_index = build_typewell_index(train_pairs)
+        tqdm.write(f'[setup] Done  ({time.time()-t0:.1f}s)  k=10, {len(train_pairs)} anchor wells')
+
     n_cached = sum(
         1 for hp, _ in train_pairs
         if os.path.exists(_cache_path(cache_dir, extract_wellname(hp), cfg_h))
     )
-    tqdm.write(f'[cache] {n_cached}/{len(train_pairs)} wells cached  '
+    tqdm.write(f'[cache] {n_cached}/{len(train_pairs)} train wells cached  '
                f'(dir={cache_dir}/  hash={cfg_h})')
 
-    def _get_alignment(wd: WellData) -> dict:
-        """Return alignment from disk cache or compute and save it."""
-        cpath = _cache_path(cache_dir, wd.name, cfg_h)
-        aln   = _load_cache(cpath)
-        if aln is None:
-            aln = _compute_alignment(wd, cfg)
-            _save_cache(cpath, aln)
-        return aln
-
-    def _load_and_process(hw_path, tw_path):
-        name = extract_wellname(hw_path)
-        hw   = load_hw(hw_path)
-        tw   = load_tw(tw_path)
-        wd   = process_well(name, hw, tw, knn, tw_index, cfg)
-        aln  = _get_alignment(wd)
-        X, y = _well_to_rows(wd, aln, cfg)
-        return wd.name, X, y, aln['pf_ancc'], wd.scalars
-
+    # -----------------------------------------------------------------------
+    # TRAIN
+    # -----------------------------------------------------------------------
     if mode == 'train':
         tqdm.write(f'\n[1/4] Well processing  (PF × 256 runs + Beam × 7 + NCC × 3 + DTW × 4 per well) ...')
         t0 = time.time()
         results = list(tqdm(
             Parallel(n_jobs=-1, return_as='generator')(
-                delayed(_load_and_process)(hp, tp) for hp, tp in train_pairs
+                delayed(_load_and_process)(hp, tp, knn, tw_index, cfg, cache_dir, cfg_h)
+                for hp, tp in train_pairs
             ),
             total=len(train_pairs),
             desc='  wells',
@@ -277,6 +359,13 @@ def run_pipeline(cfg, mode: str = 'train',
 
         save_models(models, {'oof': oof_dict, 'stack_w': stack_w}, models_dir)
 
+        # Save KNN + typewell index so predict mode skips reading all training CSVs
+        with open(knn_path, 'wb') as f:
+            pickle.dump(knn, f, protocol=4)
+        with open(twi_path, 'wb') as f:
+            pickle.dump(tw_index, f, protocol=4)
+        tqdm.write(f'       KNN + typewell index saved to {models_dir}/')
+
         oof_rmse = float(np.sqrt(np.mean(
             (y_all - np.column_stack(list(oof_dict.values())) @ stack_w) ** 2
         )))
@@ -296,6 +385,9 @@ def run_pipeline(cfg, mode: str = 'train',
         _sep()
         return None
 
+    # -----------------------------------------------------------------------
+    # PREDICT
+    # -----------------------------------------------------------------------
     elif mode == 'predict':
         test_pairs = list_wells(test_dir)
         tqdm.write(f'  test  dir  : {test_dir}  ({len(test_pairs)} wells)')
@@ -313,52 +405,25 @@ def run_pipeline(cfg, mode: str = 'train',
 
         tqdm.write(f'\n[2/2] Running inference on {len(test_pairs)} test wells ...')
         t0 = time.time()
-        rows = []
-        for hp, tp in tqdm(test_pairs, desc='  test wells', unit='well',
-                           bar_format=_BAR_FMT, ncols=80):
-            name = extract_wellname(hp)
-            hw   = load_hw(hp)
-            tw   = load_tw(tp)
-            wd   = process_well(name, hw, tw, knn, tw_index, cfg)
-            aln  = _get_alignment(wd)        # cache hit → instant; miss → compute+save
-            X, _ = _well_to_rows(wd, aln, cfg)
 
-            from collections import defaultdict as _dd
-            import xgboost as xgb_lib
-            fold_groups: dict = _dd(list)
-            for mname in loaded_models:
-                base_name = mname.rsplit('_f', 1)[0] if '_f' in mname else mname
-                fold_groups[base_name].append(mname)
-            preds = []
-            for base_name in sorted(fold_groups):
-                fold_preds = []
-                for mname in fold_groups[base_name]:
-                    m = loaded_models[mname]
-                    if isinstance(m, xgb_lib.Booster):
-                        fold_preds.append(m.predict(xgb_lib.DMatrix(X)))
-                    else:
-                        fold_preds.append(m.predict(X))
-                preds.append(np.mean(fold_preds, axis=0))
-            if not preds:
-                tqdm.write(f'  [warn] no predictions for {name}, skipping')
-                continue
-            base    = np.column_stack(preds)
-            pf_d    = np.diff(np.concatenate([[wd.scalars['last_known_tvt']], aln['pf_ancc']]))
-            d_blend = blend_predictions(base, stack_w[:base.shape[1]], pf_d, cfg.BLEND['w_pf'])
-            z_eval  = wd.hw.iloc[wd.ps_idx:]['Z'].values
-            md_eval = wd.hw.iloc[wd.ps_idx:]['MD'].values
-            tvt_pred = postprocess_well(
-                d_blend, pf_d, z_eval,
-                md_eval - md_eval[0],
-                wd.scalars['last_known_tvt'],
-                cfg.PP, cfg.USPACE,
-            )
-            eval_hw = wd.hw.iloc[wd.ps_idx:]
-            for idx, tvt_val in zip(eval_hw.index, tvt_pred):
-                row_md = int(wd.hw.loc[idx, 'MD'])
-                rows.append({'id': f'{name}_{row_md}', 'tvt': tvt_val})
+        all_rows = list(tqdm(
+            Parallel(n_jobs=-1, return_as='generator')(
+                delayed(_predict_one_well)(
+                    hp, tp, knn, tw_index, loaded_models, stack_w,
+                    cfg, cache_dir, cfg_h,
+                )
+                for hp, tp in test_pairs
+            ),
+            total=len(test_pairs),
+            desc='  test wells',
+            unit='well',
+            bar_format=_BAR_FMT,
+            ncols=80,
+        ))
 
+        rows = [row for well_rows in all_rows if well_rows for row in well_rows]
         df_out = pd.DataFrame(rows)
+
         _sep()
         tqdm.write(f'  Predictions  : {len(df_out):,} rows  ({len(test_pairs)} wells)')
         tqdm.write(f'  TVT range    : [{df_out["tvt"].min():.2f}, {df_out["tvt"].max():.2f}]  '
