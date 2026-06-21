@@ -27,14 +27,14 @@ def _run_batch(
     tvt_p = rng.normal(tvt_start, sigma_0, (S, P))
     log_w = np.zeros((S, P))
     traj  = np.empty((S, T))
-    vel_p = rng.normal(0.04, 0.02, (S, P)).clip(0.0) if use_velocity else None
+    vel_p = rng.normal(0.0, 0.02, (S, P)) if use_velocity else None
 
     for t in range(T):
         if use_velocity:
-            vel_p = (vel_p + rng.normal(0, 0.005, (S, P))).clip(0.0)
+            vel_p = vel_p + rng.normal(0, 0.005, (S, P))
             tvt_p = tvt_p + vel_p
         else:
-            tvt_p += np.clip(rng.normal(0.04, 0.3, (S, P)), 0.0, None)
+            tvt_p += rng.normal(0.0, 0.3, (S, P))
 
         if not np.isnan(hw_s[t]):
             pred = np.interp(tvt_p.ravel(), tw_tvt, tw_s).reshape(S, P)
