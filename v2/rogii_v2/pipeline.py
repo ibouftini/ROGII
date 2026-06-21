@@ -52,7 +52,8 @@ def _process_one_well(hw_path, tw_path, knn, dense_imp, cfg, is_train):
 
     kgr = gr_interp.iloc[:ps_idx].values.astype(np.float32)
     ktvt = kn['TVT_input'].dropna().values.astype(np.float32)
-    ncc_results, ncc_ens = multi_scale_ncc(kgr, ktvt, hgr)
+    ncc_results, ncc_ens = multi_scale_ncc(kgr, ktvt, hgr,
+                                          hws=cfg.NCC_HWS, stride=cfg.NCC_STRIDE)
 
     # LikPF
     likpf_dict, _ = run_lik_pf(hw, tw_tvt, tw_gr, cfg)
